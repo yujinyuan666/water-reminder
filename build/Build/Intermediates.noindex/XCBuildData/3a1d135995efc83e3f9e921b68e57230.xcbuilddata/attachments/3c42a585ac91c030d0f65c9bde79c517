@@ -1,0 +1,36 @@
+{
+  "" : {
+    "const-values" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary.swiftconstvalues",
+    "dependencies" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary.d",
+    "diagnostics" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary.dia",
+    "emit-module-dependencies" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary-emit-module.dia",
+    "pch" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminder-primary.swiftdeps"
+  },
+  "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/WaterReminder/AppSettings.swift" : {
+    "index-unit-output-path" : "/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/AppSettings.o",
+    "llvm-bc" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/AppSettings.bc",
+    "object" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/AppSettings.o"
+  },
+  "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/WaterReminder/MenuView.swift" : {
+    "index-unit-output-path" : "/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/MenuView.o",
+    "llvm-bc" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/MenuView.bc",
+    "object" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/MenuView.o"
+  },
+  "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/WaterReminder/ReminderManager.swift" : {
+    "index-unit-output-path" : "/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/ReminderManager.o",
+    "llvm-bc" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/ReminderManager.bc",
+    "object" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/ReminderManager.o"
+  },
+  "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/WaterReminder/WaterReminderApp.swift" : {
+    "index-unit-output-path" : "/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminderApp.o",
+    "llvm-bc" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminderApp.bc",
+    "object" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/WaterReminderApp.o"
+  },
+  "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/DerivedSources/GeneratedAssetSymbols.swift" : {
+    "index-unit-output-path" : "/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/GeneratedAssetSymbols.o",
+    "llvm-bc" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/GeneratedAssetSymbols.bc",
+    "object" : "/Users/yujinyuan/WorkBuddy/mac定时提醒/WaterReminder/build/Build/Intermediates.noindex/WaterReminder.build/Release/WaterReminder.build/Objects-normal/x86_64/GeneratedAssetSymbols.o"
+  }
+}
