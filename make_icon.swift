@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 let size = NSSize(width: 1024, height: 1024)
 let image = NSImage(size: size)
 
+
 image.lockFocus()
 
 let ctx = NSGraphicsContext.current!.cgContext
