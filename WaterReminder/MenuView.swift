@@ -45,19 +45,23 @@ struct MenuView: View {
 
     // MARK: 状态
     private var statusSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("下次提醒").font(.caption).foregroundColor(.secondary)
-            if let next = settings.nextReminderDate() {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(next, format: .dateTime.month().day().hour().minute())
-                        .font(.subheadline.bold())
-                    Spacer()
-                    Text(next, style: .relative)
-                        .font(.caption)
-                        .foregroundColor(.blue)
+        // 用 TimelineView 包裹：每 30 秒（以及面板每次出现时）重新计算“下次提醒”，
+        // 避免 MenuBarExtra 复用视图缓存导致显示停留在旧日期（如昨天）。
+        TimelineView(PeriodicTimelineSchedule(from: .now, by: 30)) { _ in
+            VStack(alignment: .leading, spacing: 4) {
+                Text("下次提醒").font(.caption).foregroundColor(.secondary)
+                if let next = settings.nextReminderDate() {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(next, format: .dateTime.month().day().hour().minute())
+                            .font(.subheadline.bold())
+                        Spacer()
+                        Text(next, style: .relative)
+                            .font(.caption)
+                            .foregroundColor(.blue)
+                    }
+                } else {
+                    Text("暂无计划提醒").font(.subheadline).foregroundColor(.secondary)
                 }
-            } else {
-                Text("暂无计划提醒").font(.subheadline).foregroundColor(.secondary)
             }
         }
     }
