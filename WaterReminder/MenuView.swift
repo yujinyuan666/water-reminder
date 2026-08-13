@@ -12,8 +12,10 @@ struct MenuView: View {
             Divider()
             statusSection
             Divider()
-            quickActions
-            Divider()
+            if settings.showQuickActions {
+                quickActions
+                Divider()
+            }
             rulesListSection
             Divider()
             footerSection

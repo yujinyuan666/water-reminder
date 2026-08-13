@@ -68,6 +68,13 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// 是否在菜单中显示“立即提醒”和“测试弹窗”快捷操作
+    @Published var showQuickActions: Bool {
+        didSet {
+            defaults.set(showQuickActions, forKey: "showQuickActions")
+        }
+    }
+
     /// 提醒规则列表，序列化为 JSON 存入 UserDefaults
     @Published var rules: [ReminderRule] {
         didSet {
@@ -83,6 +90,7 @@ final class AppSettings: ObservableObject {
 
     private init() {
         self.isEnabled = (defaults.object(forKey: "isEnabled") as? Bool) ?? true
+        self.showQuickActions = (defaults.object(forKey: "showQuickActions") as? Bool) ?? false
         if let data = defaults.data(forKey: "rules"),
            let decoded = try? JSONDecoder().decode([ReminderRule].self, from: data) {
             // 尊重用户操作：列表被清空时也恢复为空，不再塞回默认规则
