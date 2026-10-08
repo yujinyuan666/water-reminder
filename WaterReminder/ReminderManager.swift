@@ -257,13 +257,25 @@ final class FullScreenAlertManager {
 
     private var timer: Timer?
     private var alertWindow: AlertPanel?
-    /// 已触发记录 "ruleID-hour-minute"，防止同一分钟重复弹窗
+    /// 已触发记录 "ruleID-触发时刻时间戳"，防止同一个触发点重复弹窗
     private var firedKeys: Set<String> = []
     private var lastCheckDay: Int = 0
     private var snoozeWorkItem: DispatchWorkItem?
+    /// 阻止 App Nap 的活动令牌：持有期间系统不会把本 App 降频
+    private var activityToken: NSObjectProtocol?
+
+    /// 容忍窗口：触发点过去这么久之内仍然补弹。
+    /// 用来兜住「这一次 tick 被推迟」的情况（App Nap、系统繁忙、屏幕锁定），
+    /// 否则 tick 一旦跨过目标分钟，这次提醒就永久丢失了。
+    private let graceWindow: TimeInterval = 300
 
     func start() {
         guard timer == nil else { return }
+        // 菜单栏 App 长时间无交互会被 App Nap 降频，Timer 一停摆就会漏掉提醒
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated],
+            reason: "等待喝水提醒触发"
+        )
         checkAndFire()
         let t = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
             self?.checkAndFire()
@@ -275,20 +287,19 @@ final class FullScreenAlertManager {
     func stop() {
         timer?.invalidate()
         timer = nil
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
     }
 
     // MARK: 定时检查
     private func checkAndFire() {
         let cal = Calendar.current
         let now = Date()
-        let comp = cal.dateComponents([.weekday, .hour, .minute, .day], from: now)
-        guard let weekday = comp.weekday,
-              let hour = comp.hour,
-              let minute = comp.minute,
-              let day = comp.day else { return }
 
         // 新的一天：清空已触发记录
-        if day != lastCheckDay {
+        if let day = cal.dateComponents([.day], from: now).day, day != lastCheckDay {
             firedKeys.removeAll()
             lastCheckDay = day
         }
@@ -298,35 +309,50 @@ final class FullScreenAlertManager {
         guard AppSettings.shared.isEnabled else { return }
 
         for rule in AppSettings.shared.rules where rule.method == .fullScreen {
-            let key = "\(rule.id.uuidString)-\(hour)-\(minute)"
-            if firedKeys.contains(key) { continue }
-
-            if shouldFire(rule: rule, weekday: weekday, hour: hour, minute: minute) {
-                firedKeys.insert(key)
-                showAlert()
-                break
-            }
+            guard let fireAt = latestFireDate(rule: rule, at: now, cal: cal) else { continue }
+            // 超出容忍窗口的旧触发点直接忽略：
+            // 免得 App 长时间没运行（或刚从睡眠唤醒）时一次性补弹一堆历史提醒
+            guard now.timeIntervalSince(fireAt) <= graceWindow else { continue }
+            let key = "\(rule.id.uuidString)-\(Int(fireAt.timeIntervalSince1970))"
+            guard !firedKeys.contains(key) else { continue }
+            firedKeys.insert(key)
+            showAlert()
+            break
         }
     }
 
-    private func shouldFire(rule: ReminderRule, weekday: Int, hour: Int, minute: Int) -> Bool {
+    /// 规则「此刻应当触发」的那个时刻，没有则返回 nil。
+    ///
+    /// 判定方式不再是「当前分钟是否正好等于目标分钟」，而是「不晚于 now 的最近一个触发点」——
+    /// 调用方再判断它是否落在容忍窗口内。这样即使 15 秒的轮询被推迟到跨过了目标分钟，
+    /// 下一次 tick 依然能把这次提醒补上；同时容忍窗口也挡住了"唤醒后补弹一堆历史提醒"。
+    private func latestFireDate(rule: ReminderRule, at now: Date, cal: Calendar) -> Date? {
         switch rule.type {
         case .fixedTime:
-            let weekdayOK = rule.weekdays.isEmpty || rule.weekdays.contains(weekday)
             // .once 不限周几（在下一次该时刻出现时提醒）
-            guard weekdayOK || rule.fixedRepeat == .once else { return false }
-            guard let (h, m) = ReminderManager.shared.parseHM(rule.time) else { return false }
-            return hour == h && minute == m
+            let weekdayOK = rule.weekdays.isEmpty
+                || rule.weekdays.contains(cal.component(.weekday, from: now))
+            guard weekdayOK || rule.fixedRepeat == .once else { return nil }
+            guard let (h, m) = ReminderManager.shared.parseHM(rule.time),
+                  let fireAt = cal.date(bySettingHour: h, minute: m, second: 0, of: now) else { return nil }
+            return now >= fireAt ? fireAt : nil
+
         case .cycleInterval:
-            let weekdayOK = rule.weekdays.isEmpty || rule.weekdays.contains(weekday)
-            guard weekdayOK else { return false }
+            let weekdayOK = rule.weekdays.isEmpty
+                || rule.weekdays.contains(cal.component(.weekday, from: now))
+            guard weekdayOK, rule.intervalMinutes > 0 else { return nil }
             guard let (sh, sm) = ReminderManager.shared.parseHM(rule.startTime),
-                  let (eh, em) = ReminderManager.shared.parseHM(rule.endTime) else { return false }
-            let startTotal = sh * 60 + sm
-            let endTotal = eh * 60 + em
-            let nowTotal = hour * 60 + minute
-            guard nowTotal >= startTotal, nowTotal <= endTotal, rule.intervalMinutes > 0 else { return false }
-            return (nowTotal - startTotal) % rule.intervalMinutes == 0
+                  let (eh, em) = ReminderManager.shared.parseHM(rule.endTime),
+                  let start = cal.date(bySettingHour: sh, minute: sm, second: 0, of: now) else { return nil }
+            // 步进全部用「当天第几分钟」做整数运算，避免浮点除法在边界上的误差
+            let startMin = sh * 60 + sm
+            let endMin = eh * 60 + em
+            let nowMin = cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now)
+            guard nowMin >= startMin else { return nil }
+            let lastIndex = (endMin - startMin) / rule.intervalMinutes
+            let index = min((nowMin - startMin) / rule.intervalMinutes, lastIndex)
+            guard index >= 0 else { return nil }
+            return start.addingTimeInterval(TimeInterval(index * rule.intervalMinutes * 60))
         }
     }
 
