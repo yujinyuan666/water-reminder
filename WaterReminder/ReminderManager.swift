@@ -422,12 +422,21 @@ final class FullScreenAlertManager {
         panel.isReleasedWhenClosed = false
 
         // 2) 内容视图：整屏 ZStack（暗色遮罩 + 居中卡片）
+        //
+        // 这里刻意**不**用 contentViewController：Apple 文档写明「赋值 contentViewController
+        // 会让窗口按内容的理想尺寸重新布局」（causes the window to resize based on the current
+        // size of the contentViewController），而本窗口 contentRect 的原点正是屏幕左下角 (0,0)，
+        // 窗口一被缩就整块贴到左下角去了；macOS 15 起更极端，赋完值窗口 frame 直接归零。
+        // 改用 NSHostingView 直接当 contentView，尺寸完全由我们控制。
         let rootView = FullScreenAlertView(
             onDismiss: { [weak self] in self?.dismissAlert() },
             onSnooze: { [weak self] in self?.snooze() }
         )
-        let controller = NSHostingController(rootView: rootView)
-        panel.contentViewController = controller
+        let hosting = NSHostingView(rootView: rootView)
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
+        hosting.autoresizingMask = [.width, .height]     // 窗口尺寸变化时跟着铺满
+        panel.contentView = hosting
+        panel.setFrame(frame, display: false)            // 再兜一次：确保窗口就是整屏
 
         // 3) 淡入显示。先激活 App，保证 Esc / 回车能被这个 key window 收到
         panel.alphaValue = 0
