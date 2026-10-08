@@ -120,4 +120,17 @@ final class AppSettings: ObservableObject {
     func nextReminderDate() -> Date? {
         ReminderManager.shared.nextReminderDate()
     }
+
+    /// 直接从 UserDefaults 判断当前是否存在「通知」类规则。
+    /// 供通知中心的 delegate 在非主线程调用 —— 这里刻意不触碰 @Published 属性，避免跨线程访问。
+    /// 注意：didSet 里是「先写 defaults、再排程」，所以排程完成时读到的一定是最新配置。
+    static var hasNotificationRuleInStore: Bool {
+        let enabled = (UserDefaults.standard.object(forKey: "isEnabled") as? Bool) ?? true
+        guard enabled,
+              let data = UserDefaults.standard.data(forKey: "rules"),
+              let decoded = try? JSONDecoder().decode([ReminderRule].self, from: data) else {
+            return false
+        }
+        return decoded.contains { $0.method == .notification }
+    }
 }

@@ -10,10 +10,13 @@ final class ReminderManager {
 
     let identifierPrefix = "waterreminder."
 
-    /// 请求通知权限，授权后立即排程
+    /// 请求通知权限；启动时先无条件做一次「清理 + 重排」，授权成功后再排一次
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
         center.delegate = NotificationCenterDelegate.shared
+        // 启动即清理：历史版本排下的待发/已交付通知都在这里被清掉，
+        // 不依赖用户是否重新授权（已授权时 requestAuthorization 不一定回到主线程重排）。
+        DispatchQueue.main.async { self.rescheduleAll() }
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             if granted {
                 DispatchQueue.main.async { self.rescheduleAll() }
@@ -21,12 +24,19 @@ final class ReminderManager {
         }
     }
 
-    /// 清除旧提醒并重新排程
+    /// 清除旧提醒并重新排程。
+    ///
+    /// 这里刻意做「全量清理」而不是按 identifier 前缀挑选自己的请求：
+    /// UNUserNotificationCenter 是按 App 隔离的，本 App 名下的待发/已发通知全归自己所有，
+    /// 全清不会影响其他应用；同时也能清掉历史版本遗留的孤儿请求 ——
+    /// 它们的命名规则可能与当前版本不同，按前缀过滤是匹配不到的，会一直弹在右上角。
     func rescheduleAll() {
         let center = UNUserNotificationCenter.current()
-        center.getPendingNotificationRequests { requests in
-            let mine = requests.filter { $0.identifier.hasPrefix(self.identifierPrefix) }
-            center.removePendingNotificationRequests(withIdentifiers: mine.map { $0.identifier })
+        center.removeAllPendingNotificationRequests()
+        center.removeAllDeliveredNotifications()
+        // getPending 的回调发生在系统处理完上面的移除之后，借它当一次「屏障」，
+        // 保证接下来的 add 一定排在 remove 之后，避免移除与新增互相竞态。
+        center.getPendingNotificationRequests { _ in
             self.schedule()
         }
     }
@@ -35,13 +45,16 @@ final class ReminderManager {
         let s = AppSettings.shared
         guard s.isEnabled, !s.rules.isEmpty else { return }
 
+        // 只有「通知」类规则才需要排系统通知；全屏提示规则一律不注册通知请求
+        let notificationRules = s.rules.filter { $0.method == .notification }
+
         // 1) 汇总所有"重复触发器"（按 weekday+hour+minute 去重）和"一次性触发时间"
         var repeating: Set<RepeatingFire> = []
         var oneTimeDates: [Date] = []
         let now = Date()
         let cal = Calendar.current
 
-        for rule in s.rules where rule.method == .notification {
+        for rule in notificationRules {
             switch rule.type {
             case .fixedTime:
                 guard let (h, m) = parseHM(rule.time) else { break }
@@ -195,8 +208,14 @@ final class ReminderManager {
         return candidates.min()
     }
 
-    /// 手动发送一条即时提醒
+    /// 手动发送一条即时提醒：遵循规则里配置的提醒方式。
+    /// 只有存在「通知」类规则时才发系统通知；否则直接弹居中窗口，
+    /// 避免"所有规则都是全屏提示"时手动触发却冒出一个右上角横幅。
     func sendImmediateReminder() {
+        guard AppSettings.hasNotificationRuleInStore else {
+            DispatchQueue.main.async { FullScreenAlertManager.shared.showAlertNow() }
+            return
+        }
         let content = makeContent()
         content.body = "手动提醒：该喝水啦！"
         let id = "\(identifierPrefix)manual_\(Int(Date().timeIntervalSince1970))"
@@ -205,7 +224,9 @@ final class ReminderManager {
     }
 }
 
-/// 确保通知在前台时也能弹出
+/// 确保通知在前台时也能弹出，但只放行「通知」类规则产生的提醒。
+/// 全屏提示规则不该产生任何右上角横幅 —— 这里是兜底闸门：
+/// 无论系统里有没有残留的待发请求，只要当前配置里没有通知类规则，就一律不外显。
 final class NotificationCenterDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationCenterDelegate()
 
@@ -214,7 +235,8 @@ final class NotificationCenterDelegate: NSObject, UNUserNotificationCenterDelega
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound])
+        // 以 UserDefaults 里的真实配置为准（didSet 是先写 defaults、再排程）
+        completionHandler(AppSettings.hasNotificationRuleInStore ? [.banner, .sound] : [])
     }
 }
 
@@ -226,15 +248,12 @@ class AlertPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
-/// 居中弹窗管理器：定时检查 `.fullScreen` 规则，到点在屏幕正中心弹出提醒窗口。
-/// 窗口为固定尺寸、不覆盖全屏，图片/内容始终居中显示。
+/// 全屏提醒管理器：定时检查 `.fullScreen` 规则，到点用一个铺满整屏的暗色遮罩 + 居中卡片提醒。
+/// 遮罩会拦截鼠标点击（避免误触到后面的应用），需点「我知道了」或按 Esc 才关闭。
 /// 需应用保持运行，应用退出后弹窗提示不生效。
 final class FullScreenAlertManager {
     static let shared = FullScreenAlertManager()
     private init() {}
-
-    /// 弹窗初始尺寸（pt），可在此调整；窗口可被用户缩放
-    private let alertSize = NSSize(width: 420, height: 360)
 
     private var timer: Timer?
     private var alertWindow: AlertPanel?
@@ -322,32 +341,26 @@ final class FullScreenAlertManager {
         snoozeWorkItem = nil
 
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let frame = screen.frame
 
-        // 1) 屏幕正中心定位：无论分辨率如何，窗口水平、垂直居中
-        let x = screen.frame.midX - alertSize.width / 2
-        let y = screen.frame.midY - alertSize.height / 2
-        let contentRect = NSRect(x: x, y: y, width: alertSize.width, height: alertSize.height)
-
-        // 2) 普通居中窗口：带标题栏（含系统关闭按钮）、可拖动、可缩放，非全屏
+        // 1) 铺满当前屏幕的无边框窗口：暗色遮罩由 SwiftUI 层绘制，窗口本身保持透明
         let panel = AlertPanel(
-            contentRect: contentRect,
-            styleMask: [.titled, .closable, .resizable],
+            contentRect: frame,
+            styleMask: [.borderless],
             backing: NSWindow.BackingStoreType.buffered,
             defer: false
         )
         panel.title = "💧 喝水提醒"
-        panel.level = NSWindow.Level.floating          // 始终置于最前（但不覆盖全屏）
-        panel.collectionBehavior = [.canJoinAllSpaces] // 所有 Space 可见（已移除全屏相关 flag）
-        panel.backgroundColor = .windowBackgroundColor
-        panel.isOpaque = true
-        panel.hasShadow = true
-        panel.hidesOnDeactivate = false                // 失活时不隐藏
-        panel.isMovable = true                         // 允许拖动
+        panel.level = NSWindow.Level.floating            // 始终置于最前
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary] // 所有 Space 可见
+        panel.backgroundColor = .clear                   // 透明背景：遮罩交给 SwiftUI
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false                  // 失活时不隐藏
+        panel.isMovable = false                          // 全屏尺寸，不允许拖动
         panel.isReleasedWhenClosed = false
-        panel.minSize = NSSize(width: 360, height: 300) // 缩放范围限制
-        panel.maxSize = NSSize(width: 620, height: 520)
 
-        // 3) 内容视图：内部为居中布局，窗口缩放/拖动时图片始终居中
+        // 2) 内容视图：整屏 ZStack（暗色遮罩 + 居中卡片）
         let rootView = FullScreenAlertView(
             onDismiss: { [weak self] in self?.dismissAlert() },
             onSnooze: { [weak self] in self?.snooze() }
@@ -355,8 +368,19 @@ final class FullScreenAlertManager {
         let controller = NSHostingController(rootView: rootView)
         panel.contentViewController = controller
 
+        // 3) 淡入显示。先激活 App，保证 Esc / 回车能被这个 key window 收到
+        panel.alphaValue = 0
         panel.orderFrontRegardless()
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         panel.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            panel.animator().alphaValue = 1
+        }
         alertWindow = panel
 
         // 提示音
@@ -380,56 +404,65 @@ final class FullScreenAlertManager {
     }
 }
 
-/// 居中弹窗内容视图：应用图标图片 + 提醒文字 + 操作按钮。
-/// 布局整体居中：窗口缩放或拖动时内容始终保持在窗口中心。
+/// 全屏提醒内容视图：铺满整屏的暗色遮罩 + 屏幕正中的卡片。
+/// 遮罩本身会吞掉鼠标点击，避免用户误触到后面的应用；关闭只能通过按钮或 Esc。
 struct FullScreenAlertView: View {
     let onDismiss: () -> Void
     let onSnooze: () -> Void
 
     var body: some View {
-        VStack(spacing: 20) {
-            // 居中显示应用图标图片（自适应原始比例）
-            Image(nsImage: NSApplication.shared.applicationIconImage)
-                .resizable()
-                .scaledToFit()
-                .frame(width: 110, height: 110)
-                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+        ZStack {
+            // 铺满整屏的暗色遮罩
+            Color.black.opacity(0.45)
 
-            Text("喝水时间到！")
-                .font(.system(size: 28, weight: .bold))
-                .foregroundColor(.primary)
+            // 居中卡片
+            VStack(spacing: 20) {
+                // 居中显示应用图标图片（自适应原始比例）
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 110, height: 110)
+                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
 
-            Text("该起来喝杯水了，保持水分充足")
-                .font(.system(size: 16))
-                .foregroundColor(.secondary)
+                Text("喝水时间到！")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
 
-            HStack(spacing: 16) {
-                Button(action: onSnooze) {
-                    Text("稍后提醒")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(.primary)
-                        .frame(width: 130, height: 40)
-                        .background(Color.primary.opacity(0.08))
-                        .cornerRadius(20)
+                Text("该起来喝杯水了，保持水分充足")
+                    .font(.system(size: 16))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 16) {
+                    Button(action: onSnooze) {
+                        Text("稍后提醒")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(.primary)
+                            .frame(width: 130, height: 40)
+                            .background(Color.primary.opacity(0.08))
+                            .cornerRadius(20)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: onDismiss) {
+                        Text("我知道了")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 130, height: 40)
+                            .background(Color.blue)
+                            .cornerRadius(20)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.defaultAction) // 回车键关闭
                 }
-                .buttonStyle(.plain)
-
-                Button(action: onDismiss) {
-                    Text("我知道了")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(width: 130, height: 40)
-                        .background(Color.blue)
-                        .cornerRadius(20)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.defaultAction) // 回车键关闭
+                .padding(.top, 4)
             }
-            .padding(.top, 4)
+            .padding(36)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .shadow(color: .black.opacity(0.3), radius: 30, y: 12)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity) // 撑满窗口，内容自动居中
-        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity) // 撑满整屏，卡片自动居中
         .onExitCommand { onDismiss() } // Esc 键关闭
     }
 }
