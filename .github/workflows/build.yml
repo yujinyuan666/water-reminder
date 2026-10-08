@@ -1,0 +1,296 @@
+name: 构建与发布
+
+# 触发：
+#   · 推送到 master / main        -> 构建 + 更新「最新构建」预发布 Release
+#   · 推送 v* 标签（如 v1.0.1）   -> 构建 + 发布正式 Release
+#   · 手动触发（Actions 页面）    -> 同上，按当前分支走
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# 创建 / 更新 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一个分支串行构建，避免 Release 资产互相覆盖
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: WaterReminder
+  SCHEME: WaterReminder
+  PROJECT: WaterReminder.xcodeproj
+  DERIVED: build/dd
+  # 未持有 Apple 开发者证书，采用 ad-hoc 自签名
+  # 需要「下载即开、无任何提示」的话，见 README「正式分发」章节
+  APP_PATH: build/dd/Build/Products/Release/WaterReminder.app
+
+jobs:
+  build:
+    name: 构建 macOS App
+    # macos-15 = Apple Silicon (arm64) 镜像，在此交叉编译出 arm64 + x86_64 通用二进制
+    # 注意：macos-14 镜像已于 2026-11-02 退役（10 月有熔断窗口），不要回退到 macos-14
+    # 可选值：macos-15 / macos-latest(=macos-26) / macos-15-xlarge
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整历史来支持 tags / 版本号
+
+      - name: 环境信息
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          xcodebuild -version
+          gh --version
+
+      # ---------------------------------------------------------------
+      # 1. 解析版本号与发布目标
+      # ---------------------------------------------------------------
+      - name: 解析版本号
+        id: meta
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+            RELEASE_KIND="tag"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            TAG="${GITHUB_REF_NAME}"
+            RELEASE_KIND="tag"
+          else
+            VERSION="$(grep -m1 'MARKETING_VERSION = ' "${PROJECT}/project.pbxproj" \
+              | sed -E 's/.*= *([^;]+);.*/\1/' | tr -d ' ')"
+            TAG="latest"
+            RELEASE_KIND="latest"
+          fi
+
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "kind=${RELEASE_KIND}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "build_time=${BUILD_TIME}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "版本=${VERSION} 标签=${TAG} 类型=${RELEASE_KIND} 提交=${SHORT_SHA}"
+
+      # ---------------------------------------------------------------
+      # 2. 构建（Release，通用二进制）
+      # ---------------------------------------------------------------
+      - name: 构建 App
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${PROJECT}" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -derivedDataPath "${DERIVED}" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_HARDENED_RUNTIME=NO \
+            build
+
+      # ---------------------------------------------------------------
+      # 3. ad-hoc 签名（关键：Apple Silicon 上未签名 App 会被直接杀掉）
+      # ---------------------------------------------------------------
+      - name: 签名与校验
+        run: |
+          set -euo pipefail
+          test -d "${APP_PATH}" || { echo "构建产物不存在：${APP_PATH}"; exit 1; }
+
+          codesign --force --deep --sign - "${APP_PATH}"
+
+          echo "--- 架构 ---"
+          lipo -archs "${APP_PATH}/Contents/MacOS/${APP_NAME}"
+          echo "--- 签名 ---"
+          codesign --verify --strict --verbose=2 "${APP_PATH}"
+          codesign -dv --verbose=2 "${APP_PATH}" 2>&1 | sed -n '1,12p'
+          echo "--- Info.plist ---"
+          plutil -p "${APP_PATH}/Contents/Info.plist" | sed -n '1,20p'
+
+      # ---------------------------------------------------------------
+      # 4. 打包 DMG + ZIP（附带一键安装脚本）
+      # ---------------------------------------------------------------
+      - name: 打包
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+
+          # --- 公共载荷：App + 一键安装脚本 + 说明 ---
+          for STAGE in dist/dmg_staging dist/zip_staging; do
+            rm -rf "${STAGE}"
+            mkdir -p "${STAGE}"
+            cp -R "${APP_PATH}" "${STAGE}/"
+            cp packaging/安装.command "${STAGE}/安装.command"
+            cp packaging/安装说明.txt "${STAGE}/安装说明.txt"
+            chmod +x "${STAGE}/安装.command"
+          done
+
+          # --- ZIP：解压后直接跑「安装.command」 ---
+          # 用 zip -y 而不是 ditto：避免产生 __MACOSX/ 与 ._* 冗余条目，
+          # 同时保留 Unix 权限位（安装.command 的可执行位必须留住）
+          rm -f "dist/${APP_NAME}-${VERSION}-macos.zip"
+          (
+            cd dist/zip_staging
+            zip -r -y -q "../${APP_NAME}-${VERSION}-macos.zip" \
+              "${APP_NAME}.app" "安装.command" "安装说明.txt"
+          )
+
+          # --- DMG：拖拽安装 + 一键安装脚本 ---
+          ln -sf /Applications dist/dmg_staging/应用程序
+          rm -f "dist/${APP_NAME}-${VERSION}.dmg"
+          hdiutil create \
+            -volname "${APP_NAME} 喝水提醒" \
+            -srcfolder dist/dmg_staging \
+            -ov -format UDZO \
+            "dist/${APP_NAME}-${VERSION}.dmg"
+
+          # --- 构建信息 ---
+          {
+            echo "应用名称: ${APP_NAME}"
+            echo "版本:     ${VERSION}"
+            echo "提交:     $(git rev-parse HEAD)"
+            echo "短提交:   ${{ steps.meta.outputs.short_sha }}"
+            echo "来源:     ${GITHUB_REF_NAME} (${GITHUB_REF})"
+            echo "构建时间: ${{ steps.meta.outputs.build_time }}"
+            echo "架构:     $(lipo -archs "${APP_PATH}/Contents/MacOS/${APP_NAME}")"
+            echo "最低系统: macOS 13.0"
+            echo "签名方式: ad-hoc 自签名（未公证）"
+          } > dist/BUILD-INFO.txt
+
+          echo "--- dist 产物 ---"
+          ls -lh dist/*.dmg dist/*.zip dist/BUILD-INFO.txt
+
+      # ---------------------------------------------------------------
+      # 5. 生成 Release 说明
+      # ---------------------------------------------------------------
+      - name: 生成 Release 说明
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHORT="${{ steps.meta.outputs.short_sha }}"
+          REPO="${GITHUB_REPOSITORY}"
+
+          if [[ "${{ steps.meta.outputs.kind }}" == "latest" ]]; then
+            HEADLINE="> 🔄 这是跟随 \`master\` 分支自动滚动的构建，每次推送都会被覆盖为最新版本。"
+          else
+            HEADLINE="> 🎉 正式发布版本 \`${{ steps.meta.outputs.tag }}\`。"
+          fi
+
+          cat > dist/RELEASE_NOTES.md <<EOF
+          # 💧 喝水提醒 ${VERSION}
+
+          ${HEADLINE}
+
+          | 项目 | 值 |
+          |------|-----|
+          | 版本 | \`${VERSION}\` |
+          | 提交 | [\`${SHORT}\`](https://github.com/${REPO}/commit/${GITHUB_SHA}) |
+          | 来源 | \`${GITHUB_REF_NAME}\` |
+          | 构建时间 | ${{ steps.meta.outputs.build_time }} |
+          | 架构 | Universal（Apple Silicon + Intel） |
+          | 最低系统 | macOS 13.0 |
+
+          ## 📦 下载
+
+          | 文件 | 说明 |
+          |------|------|
+          | \`${APP_NAME}-${VERSION}.dmg\` | 磁盘镜像：打开后跑 \`安装.command\`，或把 App 拖进「应用程序」 |
+          | \`${APP_NAME}-${VERSION}-macos.zip\` | 压缩包：解压后双击 \`安装.command\` |
+          | \`BUILD-INFO.txt\` | 本次构建的元信息 |
+
+          ## ⚠️ 首次打开提示
+
+          本版本使用 **ad-hoc 自签名**（未走 Apple 开发者公证），首次打开会被 Gatekeeper 拦截一次：
+
+          1. 把 \`${APP_NAME}.app\` 拖进「应用程序」
+          2. **右键点击** App → 选「打开」→ 弹窗里再点「打开」
+          3. macOS 15 (Sequoia) 及以上若没有「打开」按钮：打开 **系统设置 → 隐私与安全性**，在页面底部点「仍要打开」
+
+          **更省事的办法**：直接双击包里的 \`安装.command\`，它会自动完成安装、清除隔离标记并启动应用。
+
+          > 提示：应用内「开机自启动」依赖 macOS 的 \`SMAppService\`，需 App 位于 \`/Applications\` 且签名有效。
+          EOF
+
+          cat dist/RELEASE_NOTES.md
+
+      # ---------------------------------------------------------------
+      # 6. 上传 Actions 产物（保留 30 天，方便回看）
+      # ---------------------------------------------------------------
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaterReminder-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short_sha }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/BUILD-INFO.txt
+          retention-days: 30
+
+      # ---------------------------------------------------------------
+      # 7. 发布到 GitHub Releases
+      #    · 普通分支推送 -> 滚动更新标签为 latest 的预发布（用户永远能下到最新版）
+      #    · v* 标签推送  -> 创建正式 Release
+      # ---------------------------------------------------------------
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          KIND="${{ steps.meta.outputs.kind }}"
+          SHORT="${{ steps.meta.outputs.short_sha }}"
+
+          if [[ "${KIND}" == "latest" ]]; then
+            # 把滚动标签 latest 移到当前提交
+            git tag -f latest "${GITHUB_SHA}"
+            git push -f origin "refs/tags/latest"
+
+            TITLE="喝水提醒 ${VERSION} · 最新构建 (${SHORT})"
+            FLAGS=(--prerelease)
+          else
+            TITLE="喝水提醒 ${TAG}"
+            FLAGS=()
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，更新标题与说明"
+            gh release edit "${TAG}" \
+              --title "${TITLE}" \
+              --notes-file dist/RELEASE_NOTES.md \
+              ${FLAGS[@]+"${FLAGS[@]}"}
+          else
+            echo "创建 Release ${TAG}"
+            gh release create "${TAG}" \
+              --title "${TITLE}" \
+              --notes-file dist/RELEASE_NOTES.md \
+              ${FLAGS[@]+"${FLAGS[@]}"}
+          fi
+
+          echo "上传产物..."
+          gh release upload "${TAG}" \
+            dist/*.dmg dist/*.zip dist/BUILD-INFO.txt \
+            --clobber
+
+          echo "--- 当前 Release 资产 ---"
+          gh release view "${TAG}" --json tagName,name,isPrerelease,assets \
+            --template '{{.tagName}} | {{.name}} | prerelease={{.isPrerelease}}{{"\n"}}{{range .assets}}  - {{.name}} ({{.size}} bytes){{"\n"}}{{end}}'
