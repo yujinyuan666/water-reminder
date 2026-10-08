@@ -10,6 +10,11 @@ final class ReminderManager {
 
     let identifierPrefix = "waterreminder."
 
+    /// 触发容忍窗口：触发点过去这么久之内仍视为「应当已触发」。
+    /// 一方面兜住 tick 被推迟的情况（App Nap、系统繁忙、屏幕锁定），
+    /// 另一方面用来判断「仅一次」规则的目标时刻是否真的已经过期。
+    static let fireGraceWindow: TimeInterval = 300
+
     /// 请求通知权限；启动时先无条件做一次「清理 + 重排」，授权成功后再排一次
     func requestAuthorization() {
         let center = UNUserNotificationCenter.current()
@@ -35,9 +40,29 @@ final class ReminderManager {
         center.removeAllPendingNotificationRequests()
         center.removeAllDeliveredNotifications()
         // getPending 的回调发生在系统处理完上面的移除之后，借它当一次「屏障」，
-        // 保证接下来的 add 一定排在 remove 之后，避免移除与新增互相竞态。
+        // 保证接下来的 add 一定排在 remove 之后；再回主线程处理后续逻辑，
+        // 因为 AppSettings 的 @Published 属性只在主线程读写。
         center.getPendingNotificationRequests { _ in
-            self.schedule()
+            DispatchQueue.main.async {
+                let now = Date()
+                self.stampOnceFireTargets(now: now, cal: .current)
+                self.schedule()
+            }
+        }
+    }
+
+    /// 给还没有目标时刻的「仅一次」规则钉死一个触发时刻。
+    ///
+    /// 不做这一步的话，每次重排都会把"下一次该时刻"重算成明天，「仅一次」就变成了每天都提醒。
+    /// 目标时刻过去后**不删除规则**：规则留在列表里显示「已执行」，
+    /// 由 AppSettings 在用户改动配置时清掉目标时刻，从而重新启用（见 rules.didSet）。
+    private func stampOnceFireTargets(now: Date, cal: Calendar) {
+        let s = AppSettings.shared
+        for rule in s.rules where rule.type == .fixedTime && rule.fixedRepeat == .once {
+            guard s.onceFireTarget(for: rule) == nil else { continue }
+            guard let (h, m) = parseHM(rule.time),
+                  let next = nextFireDate(weekday: nil, hour: h, minute: m, from: now, cal: cal) else { continue }
+            s.stampOnceFireTarget(next, for: rule)
         }
     }
 
@@ -60,10 +85,10 @@ final class ReminderManager {
                 guard let (h, m) = parseHM(rule.time) else { break }
                 switch rule.fixedRepeat {
                 case .once:
-                    // 仅一次：下一次该时刻出现时提醒
-                    if let d = nextFireDate(weekday: nil, hour: h, minute: m, from: now, cal: cal) {
-                        oneTimeDates.append(d)
-                    }
+                    // 「仅一次」只看被钉死的那个目标时刻，不再重算"下一次该时刻"：
+                    // 否则每次重排都会把目标顺延到明天，「仅一次」会变成每天都提醒
+                    guard let target = s.onceFireTarget(for: rule), target > now else { break }
+                    oneTimeDates.append(target)
                 case .daily:
                     repeating.insert(RepeatingFire(weekday: nil, hour: h, minute: m))
                 case .weekly:
@@ -181,7 +206,12 @@ final class ReminderManager {
             case .fixedTime:
                 guard let (h, m) = parseHM(rule.time) else { break }
                 switch rule.fixedRepeat {
-                case .once, .daily:
+                case .once:
+                    // 「仅一次」只看被钉死的目标时刻：已执行的规则不该再出现在"下次提醒"里
+                    if let target = s.onceFireTarget(for: rule), target > now {
+                        candidates.append(target)
+                    }
+                case .daily:
                     if let d = nextFireDate(weekday: nil, hour: h, minute: m, from: now, cal: cal) {
                         candidates.append(d)
                     }
@@ -264,10 +294,8 @@ final class FullScreenAlertManager {
     /// 阻止 App Nap 的活动令牌：持有期间系统不会把本 App 降频
     private var activityToken: NSObjectProtocol?
 
-    /// 容忍窗口：触发点过去这么久之内仍然补弹。
-    /// 用来兜住「这一次 tick 被推迟」的情况（App Nap、系统繁忙、屏幕锁定），
-    /// 否则 tick 一旦跨过目标分钟，这次提醒就永久丢失了。
-    private let graceWindow: TimeInterval = 300
+    /// 容忍窗口，与 ReminderManager 共用同一个常量
+    private var graceWindow: TimeInterval { ReminderManager.fireGraceWindow }
 
     func start() {
         guard timer == nil else { return }
@@ -317,6 +345,9 @@ final class FullScreenAlertManager {
             guard !firedKeys.contains(key) else { continue }
             firedKeys.insert(key)
             showAlert()
+            // 「仅一次」弹过之后规则仍留在列表里（列表上显示「已执行」），不再重复触发：
+            // 上面的 firedKeys 挡住当天重复，graceWindow 挡住次日及以后；
+            // 用户改动这条规则的配置时会重新钉一个目标时刻，从而重新启用。
             break
         }
     }
@@ -329,10 +360,14 @@ final class FullScreenAlertManager {
     private func latestFireDate(rule: ReminderRule, at now: Date, cal: Calendar) -> Date? {
         switch rule.type {
         case .fixedTime:
-            // .once 不限周几（在下一次该时刻出现时提醒）
+            if rule.fixedRepeat == .once {
+                // 「仅一次」只针对被钉死的那个目标时刻，与周几无关
+                guard let target = AppSettings.shared.onceFireTarget(for: rule) else { return nil }
+                return now >= target ? target : nil
+            }
             let weekdayOK = rule.weekdays.isEmpty
                 || rule.weekdays.contains(cal.component(.weekday, from: now))
-            guard weekdayOK || rule.fixedRepeat == .once else { return nil }
+            guard weekdayOK else { return nil }
             guard let (h, m) = ReminderManager.shared.parseHM(rule.time),
                   let fireAt = cal.date(bySettingHour: h, minute: m, second: 0, of: now) else { return nil }
             return now >= fireAt ? fireAt : nil

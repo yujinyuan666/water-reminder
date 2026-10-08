@@ -205,38 +205,67 @@ struct RuleCardView: View {
     }
 
     private var headerRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: rule.type.icon)
-                .foregroundColor(.blue)
-                .frame(width: 18)
-            Image(systemName: rule.method.icon)
-                .font(.caption2)
-                .foregroundColor(rule.method == .fullScreen ? .purple : .orange)
-            Text(summary).font(.subheadline).foregroundColor(.primary)
-            Spacer()
-            Button {
-                expanded.toggle()
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
-            }
-            .buttonStyle(.plain)
+        // 用 TimelineView 包裹：MenuBarExtra 会复用视图，「已执行」状态随时间变化，
+        // 需要定期重算，否则面板重新打开时可能还停留在旧状态。
+        TimelineView(PeriodicTimelineSchedule(from: .now, by: 30)) { context in
+            let fired = settings.isOnceRuleFired(rule, now: context.date)
+            HStack(spacing: 8) {
+                Image(systemName: rule.type.icon)
+                    .foregroundColor(fired ? .secondary : .blue)
+                    .frame(width: 18)
+                Image(systemName: rule.method.icon)
+                    .font(.caption2)
+                    .foregroundColor(rule.method == .fullScreen ? .purple : .orange)
+                    .opacity(fired ? 0.35 : 1)
+                Text(summary)
+                    .font(.subheadline)
+                    .foregroundColor(fired ? .secondary : .primary)
+                if fired { firedBadge }
+                Spacer()
+                Button {
+                    expanded.toggle()
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .buttonStyle(.plain)
 
-            Button {
-                delete()
-            } label: {
-                Image(systemName: "trash")
-                    .font(.caption)
-                    .foregroundColor(.red)
+                Button {
+                    delete()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
+    }
+
+    /// 「仅一次」规则执行完成后的标记
+    private var firedBadge: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 9))
+            Text("已执行").font(.system(size: 10, weight: .medium))
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.secondary.opacity(0.14))
+        .cornerRadius(5)
     }
 
     private var editor: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if settings.isOnceRuleFired(rule) {
+                Text("这条提醒已执行。改动下面任一设置即可重新启用，按新设置重新计算一次触发时刻。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             // 类型切换
             Picker("类型", selection: binding(\.type)) {
                 ForEach(RuleType.allCases) { t in Text(t.rawValue).tag(t) }

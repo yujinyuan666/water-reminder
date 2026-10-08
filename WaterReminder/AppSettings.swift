@@ -81,9 +81,25 @@ final class AppSettings: ObservableObject {
             if let data = try? JSONEncoder().encode(rules) {
                 defaults.set(data, forKey: "rules")
             }
+            // 用户改动了「仅一次」规则的任一配置 => 意图是重新启用它：
+            // 清掉钉死的目标时刻，下一次重排就会按最新配置重新算一个未来的触发时刻。
+            // 不改配置的话，已执行的规则就一直是「已执行」，不会再打扰用户。
+            for updated in rules {
+                guard let previous = oldValue.first(where: { $0.id == updated.id }) else { continue }
+                if previous != updated { rearmOnceRule(id: updated.id) }
+            }
+            pruneOnceFireTargets()
             scheduleReschedule()
         }
     }
+
+    /// 「仅一次」规则被钉死的目标触发时刻：规则 ID -> timeIntervalSince1970。
+    ///
+    /// 为什么需要它：`.once` 的判定依赖"下一次该时刻"，而"下一次"永远存在 ——
+    /// 每次重排（改配置、重启 App）都会把它算成明天，「仅一次」于是变成了每天都提醒。
+    /// 这里在首次为该规则确定时刻时写死，之后不再漂移。
+    /// 时刻过去后规则**保留在列表里**（显示为「已执行」），直到用户改动它的配置才重新启用。
+    private var onceFireTargets: [String: Double] = [:]
 
     /// 防抖：连续编辑时只排程一次
     private var rescheduleWorkItem: DispatchWorkItem?
@@ -91,6 +107,9 @@ final class AppSettings: ObservableObject {
     private init() {
         self.isEnabled = (defaults.object(forKey: "isEnabled") as? Bool) ?? true
         self.showQuickActions = (defaults.object(forKey: "showQuickActions") as? Bool) ?? false
+        // 读取「仅一次」的钉死时刻（NSNumber 需要显式转 Double）
+        let rawTargets = defaults.dictionary(forKey: "onceFireTargets") ?? [:]
+        self.onceFireTargets = rawTargets.compactMapValues { ($0 as? NSNumber)?.doubleValue }
         if let data = defaults.data(forKey: "rules"),
            let decoded = try? JSONDecoder().decode([ReminderRule].self, from: data) {
             // 尊重用户操作：列表被清空时也恢复为空，不再塞回默认规则
@@ -119,6 +138,48 @@ final class AppSettings: ObservableObject {
     /// 计算下一次提醒时间，用于菜单栏展示
     func nextReminderDate() -> Date? {
         ReminderManager.shared.nextReminderDate()
+    }
+
+    // MARK: - 「仅一次」规则的目标时刻
+
+    /// 取「仅一次」规则已钉死的目标触发时刻
+    func onceFireTarget(for rule: ReminderRule) -> Date? {
+        guard let t = onceFireTargets[rule.id.uuidString] else { return nil }
+        return Date(timeIntervalSince1970: t)
+    }
+
+    /// 「仅一次」规则是否已执行：目标时刻已到（或已过）。
+    /// 状态不额外持久化 —— 直接由钉死的目标时刻推导，目标一过即为「已执行」。
+    func isOnceRuleFired(_ rule: ReminderRule, now: Date = Date()) -> Bool {
+        guard rule.type == .fixedTime, rule.fixedRepeat == .once else { return false }
+        guard let target = onceFireTarget(for: rule) else { return false }
+        return now >= target
+    }
+
+    /// 钉死「仅一次」规则的目标触发时刻（只在首次确定时写入，之后不再漂移）
+    func stampOnceFireTarget(_ date: Date, for rule: ReminderRule) {
+        onceFireTargets[rule.id.uuidString] = date.timeIntervalSince1970
+        saveOnceFireTargets()
+    }
+
+    /// 重新启用一条「仅一次」规则：清掉钉死时刻，下次重排会按最新配置重新计算。
+    /// 用户改动已执行规则的配置时调用（见 rules.didSet）。
+    func rearmOnceRule(id: UUID) {
+        guard onceFireTargets.removeValue(forKey: id.uuidString) != nil else { return }
+        saveOnceFireTargets()
+    }
+
+    private func saveOnceFireTargets() {
+        defaults.set(onceFireTargets, forKey: "onceFireTargets")
+    }
+
+    /// 清掉已被删除规则的钉死时刻，避免 UserDefaults 里留下孤儿记录
+    private func pruneOnceFireTargets() {
+        let alive = Set(rules.map { $0.id.uuidString })
+        let pruned = onceFireTargets.filter { alive.contains($0.key) }
+        guard pruned.count != onceFireTargets.count else { return }
+        onceFireTargets = pruned
+        saveOnceFireTargets()
     }
 
     /// 直接从 UserDefaults 判断当前是否存在「通知」类规则。
