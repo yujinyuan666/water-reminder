@@ -440,11 +440,28 @@ final class PanelWindowSyncView: NSView {
     var targetSize: CGSize = .zero
     /// 已投递一次同步但还没执行：避免同一轮布局里重复投递
     private var pendingSync = false
+    /// 面板重新展开时的再校准监听（见 viewDidMoveToWindow）
+    private var keyToken: NSObjectProtocol?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // 面板每次重新展示都要校准一次（SwiftUI 可能已把窗口重置成旧尺寸）
         syncIfNeeded()
+
+        // SwiftUI 在每次重新展开面板时可能把窗口重置成另一个尺寸（论坛实测：
+        // 「第一次打开高度对，第二次起变成另一个值」），而此刻视图没有换窗口、
+        // 布局也可能没变化 —— viewDidMoveToWindow 和 updateNSView 都不会触发。
+        // 所以补一层「变回 key window 就再校一次」的监听兜住这条路径。
+        if let token = keyToken { NotificationCenter.default.removeObserver(token); keyToken = nil }
+        if let window = window {
+            keyToken = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { [weak self] _ in self?.syncIfNeeded() }
+        }
+    }
+
+    deinit {
+        if let token = keyToken { NotificationCenter.default.removeObserver(token) }
     }
 
     func syncIfNeeded() {
