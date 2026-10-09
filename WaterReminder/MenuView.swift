@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 菜单栏弹出的面板：状态 + 提醒列表 + 快捷操作
 struct MenuView: View {
@@ -22,6 +23,15 @@ struct MenuView: View {
         }
         .padding(16)
         .frame(width: 340)
+        // 把高度钉在「内容理想尺寸」上：既防止被窗口的提议高度拉伸，
+        // 也让下面 PanelWindowSync 读到的一定是内容的真实高度。
+        .fixedSize(horizontal: false, vertical: true)
+        // 把内容尺寸同步给宿主窗口 —— MenuBarExtra(.window) 自己不会在内容变高/变矮时重排窗口
+        .background(
+            GeometryReader { proxy in
+                PanelWindowSync(size: proxy.size)
+            }
+        )
         // 每次打开面板时同步一次系统最新状态（含用户在系统设置里手动改动的情况）
         .onAppear { launchAtLoginEnabled = LaunchAtLogin.isEnabled }
     }
@@ -396,6 +406,76 @@ struct RuleCardView: View {
             TextField("HH:mm", text: b)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 70)
+        }
+    }
+}
+
+// MARK: - 面板尺寸同步
+
+/// 把 SwiftUI 内容的尺寸同步给 `MenuBarExtra` 的宿主窗口。
+///
+/// 为什么需要它（SwiftUI 的已知缺陷，截至 macOS 26 beta 仍无官方 API 可解）：
+/// `.menuBarExtraStyle(.window)` 的宿主窗口**只在首次展示时测量一次**内容理想尺寸，
+/// 之后内容高度变化时窗口不会重排 —— 删除一条规则后下方残留一大块空白、
+/// 收起编辑区后同样留白、新增规则后底部被裁。
+///
+/// 这里在面板内部挂一个不可见的 NSView，借 `viewDidMoveToWindow` 拿到宿主窗口
+/// （公开 API，MenuBarExtraAccess 内部也是这么做的），再把 SwiftUI 报上来的尺寸写过去。
+/// 只负责「同步」这一件事，不参与任何布局计算。
+private struct PanelWindowSync: NSViewRepresentable {
+    let size: CGSize
+
+    func makeNSView(context: Context) -> PanelWindowSyncView {
+        PanelWindowSyncView()
+    }
+
+    func updateNSView(_ nsView: PanelWindowSyncView, context: Context) {
+        nsView.targetSize = size
+        nsView.syncIfNeeded()
+    }
+}
+
+final class PanelWindowSyncView: NSView {
+    /// SwiftUI 报上来的目标内容尺寸
+    var targetSize: CGSize = .zero
+    /// 已投递一次同步但还没执行：避免同一轮布局里重复投递
+    private var pendingSync = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // 面板每次重新展示都要校准一次（SwiftUI 可能已把窗口重置成旧尺寸）
+        syncIfNeeded()
+    }
+
+    func syncIfNeeded() {
+        guard targetSize.width > 0, targetSize.height > 0, !pendingSync else { return }
+        pendingSync = true
+        // 放到下一轮 runloop：回调时 SwiftUI 这轮布局已结束，读到的窗口尺寸才是最终值
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingSync = false
+            guard let window = self.window else { return }
+            let target = NSSize(width: self.targetSize.width, height: self.targetSize.height)
+            guard target.height > 0 else { return }
+
+            // 尺寸一致就什么都不做：既是幂等保护，也切断了
+            // 「改窗口 → 触发重新布局 → 再改窗口」这条潜在死循环
+            let current = window.contentRect(forFrameRect: window.frame).size
+            guard abs(current.width - target.width) > 0.5
+                    || abs(current.height - target.height) > 0.5 else { return }
+
+            // SwiftUI 会给面板窗口设 contentMin/MaxSize 来禁止用户拖拽改尺寸，
+            // 不放宽的话窗口尺寸会被它卡住。面板 styleMask 里没有 .resizable，
+            // 用户本来就拖不动，所以这里直接改成目标尺寸是安全的。
+            window.contentMinSize = target
+            window.contentMaxSize = target
+
+            // 顶边锚定：面板是从菜单栏往下展开的，而 setContentSize 保持左下角不动，
+            // 高度一变顶边就会跟着上下跑（缩小时与菜单栏之间裂开一条缝）。
+            // 这里记下原左上角，改完尺寸再钉回去。
+            let topLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+            window.setContentSize(target)
+            window.setFrameTopLeftPoint(topLeft)
         }
     }
 }
