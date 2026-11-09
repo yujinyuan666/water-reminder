@@ -512,25 +512,34 @@ private struct TimeField: View {
                     .stroke(invalid ? Color.red : Color.clear, lineWidth: 1)
             )
             .onAppear { draft = text }
+            .onChange(of: draft) { _ in
+                // 边输入边生效：只要当前内容已经是合法时间就立刻写回模型，
+                // 不要等失焦/回车 —— MenuBarExtra 的面板点到别处会直接关掉，
+                // 失焦回调未必来得及跑，用户刚敲的时间就丢了（下次提醒也就不会重算）。
+                commit(allowInvalid: false)
+            }
             .onChange(of: text) { newValue in
                 // 外部（其它视图、重新启用规则）改了值，同步到输入框
                 if !focused, draft != newValue { draft = newValue }
             }
             .onChange(of: focused) { isFocused in
-                if !isFocused { commit() }
+                if !isFocused { commit(allowInvalid: true) }
             }
-            .onSubmit { commit() }
+            .onSubmit { commit(allowInvalid: true) }
+            .onDisappear { commit(allowInvalid: true) }
     }
 
-    /// 校验并写回；非法时保留用户的输入（方便他改）但不动模型
-    private func commit() {
+    /// 校验并写回；非法时保留用户的输入（方便他改）但不动模型。
+    /// allowInvalid=false 时（边输入边提交）非法内容不标红，避免刚敲第一个字符就闪红。
+    private func commit(allowInvalid: Bool) {
         let trimmed = draft.trimmingCharacters(in: .whitespaces)
         guard ReminderManager.shared.parseHM(trimmed) != nil else {
-            invalid = true
+            if allowInvalid { invalid = true }
             return
         }
         invalid = false
-        draft = trimmed
+        // 失焦/回车时顺手把输入框规范成解析后的形式（"9:5" → "09:05" 之类由 parseHM 的语义保证值不变）
+        if allowInvalid, draft != trimmed { draft = trimmed }
         if text != trimmed { text = trimmed }
     }
 }
