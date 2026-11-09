@@ -6,6 +6,10 @@ struct MenuView: View {
     @EnvironmentObject var settings: AppSettings
     /// 开机自启动开关的本地状态：点击后立即刷新 UI，再延迟校准系统真实状态
     @State private var launchAtLoginEnabled: Bool = LaunchAtLogin.isEnabled
+    /// 开机自启相关的错误/待放行提示；LSUIElement 应用没有别的渠道能告诉用户
+    @State private var launchAtLoginError: String?
+    /// 最近一次开关操作的序号，用于丢弃过期的延迟校准回调（防快速连点被回滚）
+    @State private var launchAtLoginGeneration: UInt64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -33,7 +37,10 @@ struct MenuView: View {
             }
         )
         // 每次打开面板时同步一次系统最新状态（含用户在系统设置里手动改动的情况）
-        .onAppear { launchAtLoginEnabled = LaunchAtLogin.isEnabled }
+        .onAppear {
+            launchAtLoginEnabled = LaunchAtLogin.isEnabled
+            launchAtLoginError = LaunchAtLogin.isEnabled ? LaunchAtLogin.errorDescription : nil
+        }
     }
 
     // MARK: 头部
@@ -108,8 +115,26 @@ struct MenuView: View {
                 Text("\(settings.rules.count) 条").font(.caption2).foregroundColor(.secondary)
             }
 
+            // 排程被截断时明确提示：静默少提醒是这类 App 最难被发现的失效
+            if let warning = settings.scheduleWarning {
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                    Text(warning)
+                        .font(.caption2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundColor(.orange)
+            }
+
             ForEach(settings.rules) { rule in
                 RuleCardView(ruleID: rule.id)
+            }
+
+            if settings.rules.isEmpty {
+                Text("还没有提醒，用下面的按钮添加一条。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
 
             HStack(spacing: 8) {
@@ -139,23 +164,45 @@ struct MenuView: View {
     // MARK: 底部
     private var footerSection: some View {
         VStack(spacing: 12) {
+            // 「立即提醒 / 测试弹窗」两个按钮原本被 showQuickActions 门控，
+            // 但全仓没有任何地方能把它打开 —— 于是这两个功能永远不可见（死开关）。
+            // 这里给用户一个真正的入口。
+            Toggle(isOn: $settings.showQuickActions) {
+                Label("显示快捷操作", systemImage: "bolt.horizontal")
+            }
+            .tint(.blue)
+
             Toggle(isOn: Binding(
                 get: { launchAtLoginEnabled },
                 set: { newValue in
+                    // 每次点击递增 generation：只有「最后一次点击」对应的延迟校准才有权改 UI。
+                    // 没有这个令牌的话，快速连点两下后，第一次点击的 0.8s 回调会把
+                    // 第二次的选择覆盖回去，开关会自己跳回来。
+                    launchAtLoginGeneration &+= 1
+                    let generation = launchAtLoginGeneration
+
                     // 1) 立即更新 UI，开关即时响应
                     launchAtLoginEnabled = newValue
-                    // 2) 注册/注销系统登录项（SMAppService 异步生效）
+                    launchAtLoginError = nil
+                    // 2) 注册/注销系统登录项（SMAppService 异步生效，同步等 XPC 回包）
                     let ok = LaunchAtLogin.setEnabled(newValue)
-                    // 3) 延迟校准真实状态（register/unregister 需一点时间生效，失败则回滚显示）
+                    if !ok {
+                        launchAtLoginEnabled = LaunchAtLogin.isEnabled
+                        launchAtLoginError = "设置失败，详情见系统日志。"
+                        return
+                    }
+                    // 3) 延迟校准真实状态（register/unregister 需一点时间生效）
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        guard generation == launchAtLoginGeneration else { return }
                         let real = LaunchAtLogin.isEnabled
-                        if ok, real != newValue {
+                        if real != newValue {
                             // 系统尚未生效，稍后再查一次
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                launchAtLoginEnabled = LaunchAtLogin.isEnabled
+                                guard generation == launchAtLoginGeneration else { return }
+                                applyLaunchAtLoginState()
                             }
                         } else {
-                            launchAtLoginEnabled = real
+                            applyLaunchAtLoginState()
                         }
                     }
                 }
@@ -164,6 +211,15 @@ struct MenuView: View {
             }
             .tint(.blue)
 
+            // 开机自启失败/待放行时把原因显示出来：
+            // LSUIElement 应用没有 Dock 图标也没有主窗口，失败只 print 用户永远看不到
+            if let msg = launchAtLoginError {
+                Text(msg)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
                 Spacer()
                 Button("退出") {
@@ -171,6 +227,12 @@ struct MenuView: View {
                 }
             }
         }
+    }
+
+    /// 把开关状态与系统的真实状态对齐，并在需要时给出提示
+    private func applyLaunchAtLoginState() {
+        launchAtLoginEnabled = LaunchAtLogin.isEnabled
+        launchAtLoginError = LaunchAtLogin.isEnabled ? LaunchAtLogin.errorDescription : nil
     }
 }
 
@@ -303,17 +365,46 @@ struct RuleCardView: View {
                 .pickerStyle(.segmented)
                 if rule.fixedRepeat == .weekly {
                     weekdayPicker(weekdayBinding())
+                    // 「指定周几」却一个都没选：通知路径会排 0 条、全屏路径也不会触发，
+                    // 而摘要显示成一串空白，用户只会觉得"到点没响"
+                    if rule.weekdays.isEmpty {
+                        warningRow("未选择任何周几，这条提醒不会触发。")
+                    }
                 }
             case .cycleInterval:
                 HStack {
                     timeField("开始", binding(\.startTime))
                     timeField("结束", binding(\.endTime))
                 }
+                if isOvernightWindow {
+                    // 结束早于开始 = 跨午夜，这是合法配置，但需要说清楚它覆盖到第二天
+                    Text("区间跨午夜：结束时间算作第二天的 \(rule.endTime)。")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Stepper("间隔：\(rule.intervalMinutes) 分钟", value: binding(\.intervalMinutes), in: 15...240, step: 15)
                 weekdayPicker(weekdayBinding())
             }
         }
         .padding(.top, 2)
+    }
+
+    /// 当前循环区间是否跨午夜
+    private var isOvernightWindow: Bool {
+        guard let (sh, sm) = ReminderManager.shared.parseHM(rule.startTime),
+              let (eh, em) = ReminderManager.shared.parseHM(rule.endTime) else { return false }
+        return eh * 60 + em <= sh * 60 + sm
+    }
+
+    private func warningRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 5) {
+            Image(systemName: "exclamationmark.triangle.fill").font(.caption2)
+            Text(text)
+                .font(.caption2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundColor(.orange)
     }
 
     // MARK: 摘要
@@ -403,10 +494,52 @@ struct RuleCardView: View {
     private func timeField(_ label: String, _ b: Binding<String>) -> some View {
         HStack {
             Text(label).font(.caption)
-            TextField("HH:mm", text: b)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 70)
+            TimeField(text: b)
         }
+    }
+}
+
+/// 时间输入框：只接受合法的 `HH:mm`，非法输入**不写回**模型并给出红框提示。
+///
+/// 为什么要专门包一层：旧实现是 `TextField("HH:mm", text: b)` 直接绑到规则上，
+/// 用户手滑打成 `9点` 或 `25:00` 会原样存进 UserDefaults，而 `parseHM` 一定返回 nil ——
+/// 结果就是这条规则静默失效，界面上完全看不出问题在哪。
+private struct TimeField: View {
+    @Binding var text: String
+    @State private var draft: String = ""
+    @State private var invalid = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField("HH:mm", text: $draft)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 70)
+            .focused($focused)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(invalid ? Color.red : Color.clear, lineWidth: 1)
+            )
+            .onAppear { draft = text }
+            .onChange(of: text) { newValue in
+                // 外部（其它视图、重新启用规则）改了值，同步到输入框
+                if !focused, draft != newValue { draft = newValue }
+            }
+            .onChange(of: focused) { isFocused in
+                if !isFocused { commit() }
+            }
+            .onSubmit { commit() }
+    }
+
+    /// 校验并写回；非法时保留用户的输入（方便他改）但不动模型
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespaces)
+        guard ReminderManager.shared.parseHM(trimmed) != nil else {
+            invalid = true
+            return
+        }
+        invalid = false
+        draft = trimmed
+        if text != trimmed { text = trimmed }
     }
 }
 
