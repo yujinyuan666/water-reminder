@@ -164,14 +164,6 @@ struct MenuView: View {
     // MARK: 底部
     private var footerSection: some View {
         VStack(spacing: 12) {
-            // 「立即提醒 / 测试弹窗」两个按钮原本被 showQuickActions 门控，
-            // 但全仓没有任何地方能把它打开 —— 于是这两个功能永远不可见（死开关）。
-            // 这里给用户一个真正的入口。
-            Toggle(isOn: $settings.showQuickActions) {
-                Label("显示快捷操作", systemImage: "bolt.horizontal")
-            }
-            .tint(.blue)
-
             Toggle(isOn: Binding(
                 get: { launchAtLoginEnabled },
                 set: { newValue in
