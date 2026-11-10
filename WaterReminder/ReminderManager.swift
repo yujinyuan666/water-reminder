@@ -17,6 +17,9 @@ final class ReminderManager {
     /// 第一代的对账回调可能在第二代已经排好之后才跑，把第二代刚排下的通知当成
     /// 残留删掉 —— 用户看到的现象是「配置反复改几次之后，某些提醒就不响了」。
     /// 只允许最新一代的对账动系统里的通知，就堵住了这个窗口。
+    ///
+    /// **只在主线程读写**。调用方（`schedule()`、`rescheduleAll()`）都在主线程；
+    /// 异步回调里要先跳回主队列再比对，别在后台队列直接读，那是数据竞争。
     private var scheduleGeneration: UInt64 = 0
 
     /// 触发容忍窗口：触发点过去这么久之内仍视为「应当已触发」。
@@ -257,33 +260,33 @@ final class ReminderManager {
         let center = UNUserNotificationCenter.current()
         let prefix = identifierPrefix
 
+        // getPendingNotificationRequests 的回调在后台队列。
+        // 拿到结果后立刻跳回主队列再做判定 —— scheduleGeneration 只在主线程读写，
+        // 而且对账要改 scheduleWarning（@Published，必须主线程）。
         center.getPendingNotificationRequests { [weak self] pending in
-            guard let self else { return }
-            // 回读是异步的，这期间用户可能又改了配置、又排了一轮。
-            // 那一轮排下的通知，在「我这一代的期望集合」里当然找不到 ——
-            // 若照删不误，用户会看到「改几次配置之后某些提醒就不响了」。
-            guard generation == self.scheduleGeneration else { return }
-
-            let actual = Set(pending.map { $0.identifier }.filter { $0.hasPrefix(prefix) })
-            let missing = expected.subtracting(actual)
-            let stale = actual.subtracting(expected)
-
-            // 同一身份下多出来的通知：已经不归任何规则管，删掉
-            if !stale.isEmpty {
-                center.removePendingNotificationRequests(withIdentifiers: Array(stale))
-            }
-
-            guard !missing.isEmpty || !stale.isEmpty || !failures.isEmpty else { return }
-
+            let ids = pending.map { $0.identifier }
             DispatchQueue.main.async {
-                // 又一次异步跳转，再确认一遍代数没变
+                guard let self else { return }
+
+                // 回读是异步的，这期间用户可能又改了配置、又排了一轮。
+                // 那一轮排下的通知，在「我这一代的期望集合」里当然找不到 ——
+                // 若照删不误，用户会看到「改几次配置之后某些提醒就不响了」。
                 guard generation == self.scheduleGeneration else { return }
-                let s = AppSettings.shared
+
+                let actual = Set(ids.filter { $0.hasPrefix(prefix) })
+                let missing = expected.subtracting(actual)
+                let stale = actual.subtracting(expected)
+
+                // 同一身份下多出来的通知：已经不归任何规则管，删掉
+                if !stale.isEmpty {
+                    center.removePendingNotificationRequests(withIdentifiers: Array(stale))
+                }
 
                 // add() 在未授权时是静默失败的，不看 error 就永远不知道。
                 // 这种情况下 missing 会等于「全部没排上」，必须让用户看见。
                 guard !missing.isEmpty || !failures.isEmpty else { return }
 
+                let s = AppSettings.shared
                 var msg = "有 \(max(missing.count, failures.count)) 条提醒没能注册到系统通知中心。"
                 msg += "请检查「系统设置 → 通知 → 喝水提醒」是否允许通知。"
                 if let first = failures.first {
