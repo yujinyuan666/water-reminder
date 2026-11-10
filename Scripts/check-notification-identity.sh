@@ -12,8 +12,10 @@
 #   「自己这个身份」排下的通知；旧版本排下的通知它既看不见、也清不掉，
 #   会继续按原计划每天弹，直到有人手工清库。
 #
-#   用证书签名时 DR 是 `identifier "com.waterreminder.app" and certificate leaf = ...`，
-#   跨构建稳定 ⇒ 新版能看见并清理旧版的通知。
+#   修法不是「必须上证书」：只要签名时显式嵌入一条身份型 DR，例如
+#     codesign --force --sign - -r='designated => identifier "com.waterreminder.app"' <App>
+#   DR 就只绑 bundle id、不绑 cdhash，跨构建稳定 ⇒ 新版能看见并清理旧版的通知。
+#   ./Scripts/sign-app.sh 默认就是这么签的（无需证书、无需钥匙串、无需 Secret）。
 #
 # 用法：
 #     ./Scripts/check-notification-identity.sh                        # 检查已装 App
@@ -24,6 +26,19 @@
 set -uo pipefail
 
 DB="${HOME}/Library/Group Containers/group.com.apple.usernoted/db2/db"
+CORRUPT_DB="${DB}.corrupt"
+
+# 这个库是 WAL 模式：目录里没有现成的 -shm/-wal 时，
+# "file:...?mode=ro" 会报 "unable to open database file (14)"，
+# 看起来像「库里没数据」，其实是打开方式的问题。带 immutable 回退。
+q_ro() {
+  local db="$1" sql="$2"
+  if [[ -e "${db}-shm" || -e "${db}-wal" ]]; then
+    sqlite3 "file:${db}?mode=ro" "${sql}" 2>/dev/null && return 0
+  fi
+  sqlite3 "file:${db}?immutable=1" "${sql}" 2>/dev/null && return 0
+  sqlite3 "${db}" "${sql}" 2>/dev/null
+}
 BUNDLE_ID="com.waterreminder.app"
 APP="${1:-/Applications/WaterReminder.app}"
 
@@ -80,53 +95,60 @@ fi
 echo
 echo "【2】系统通知库里属于本 App 的记录"
 
+SCAN_DB="${DB}"
+SCAN_NOTE=""
+
 if [[ ! -e "${DB}" ]]; then
   echo "    ⚠️  找不到通知库：${DB}"
   echo "        （未开启「完整磁盘访问」时读不到，跳过这一节）"
 else
   # 有些 macOS 版本库里 identifier 是小写，用 lower() 兜住
   QUERY_APP="SELECT app_id FROM app WHERE lower(identifier) = lower('${BUNDLE_ID}');"
-  APP_ID="$(sqlite3 "file:${DB}?mode=ro" "${QUERY_APP}" 2>/dev/null || echo "")"
+  APP_ID="$(q_ro "${DB}" "${QUERY_APP}" || echo "")"
+
+  # usernoted 有时会把「读不动的旧库」改名成 db.corrupt 再重建空库，
+  # 那种情况下活动库是空的，历史残留全在 db.corrupt 里 —— 必须一并报告，
+  # 否则会误报「本 App 从未注册过通知」。
+  if [[ -z "${APP_ID}" && -e "${CORRUPT_DB}" ]]; then
+    CORRUPT_ID="$(q_ro "${CORRUPT_DB}" "${QUERY_APP}" || echo "")"
+    if [[ -n "${CORRUPT_ID}" ]]; then
+      SCAN_DB="${CORRUPT_DB}"
+      APP_ID="${CORRUPT_ID}"
+      SCAN_NOTE="    ⚠️  活动库是空的，下面读的是被 usernoted 归档的旧库：${CORRUPT_DB}"
+    fi
+  fi
 
   if [[ -z "${APP_ID}" ]]; then
     echo "    通知库里没有 ${BUNDLE_ID} 的条目（本 App 从未注册过通知）。"
   else
+    [[ -n "${SCAN_NOTE}" ]] && echo "${SCAN_NOTE}"
     echo "    app_id = ${APP_ID}"
 
     # 待发（未送达）/ 已送达
-    PENDING="$(sqlite3 "file:${DB}?mode=ro" \
-      "SELECT count(*) FROM record WHERE app_id=${APP_ID} AND delivered_date IS NULL;" 2>/dev/null || echo "?")"
-    DELIVERED="$(sqlite3 "file:${DB}?mode=ro" \
-      "SELECT count(*) FROM record WHERE app_id=${APP_ID} AND delivered_date IS NOT NULL;" 2>/dev/null || echo "?")"
+    PENDING="$(q_ro "${SCAN_DB}" \
+      "SELECT count(*) FROM record WHERE app_id=${APP_ID} AND delivered_date IS NULL;" || echo "?")"
+    DELIVERED="$(q_ro "${SCAN_DB}" \
+      "SELECT count(*) FROM record WHERE app_id=${APP_ID} AND delivered_date IS NOT NULL;" || echo "?")"
 
     echo "    待发记录：${PENDING}"
     echo "    已送达  ：${DELIVERED}"
 
-    # 按送达次序列出最近几条，方便肉眼核对是不是「旧版本遗留」
-    echo
-    echo "    最近的记录（identifier / 送达时间 / 排程）："
-    sqlite3 "file:${DB}?mode=ro" -cmd ".mode list" -cmd ".separator ' | '" "
-      SELECT
-        substr(hex(data), 1, 0) AS _pad,
-        '  ' || coalesce(
-          (SELECT 'yes' FROM record r2 WHERE r2.rec_id = r.rec_id AND r.delivered_date IS NOT NULL), 'no'
-        ) AS _pad2
-      FROM record r WHERE r.app_id = ${APP_ID} LIMIT 1;
-    " >/dev/null 2>&1 || true
-
     # record.data 是 bplist，identifier 得用 python 解
-    python3 - "${DB}" "${APP_ID}" <<'PY' 2>/dev/null || echo "    （解析失败，可跳过）"
+    echo
+    echo "    最近的记录（identifier / 送达时间 / 标题）："
+    python3 - "${SCAN_DB}" "${APP_ID}" <<'PY' 2>/dev/null || echo "    （解析失败，可跳过）"
 import plistlib, sqlite3, sys, datetime
 db, app_id = sys.argv[1], int(sys.argv[2])
-con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
 rows = con.execute(
     "SELECT rec_id, data, delivered_date FROM record WHERE app_id=? "
-    "ORDER BY request_date DESC LIMIT 8", (app_id,)).fetchall()
+    "ORDER BY rec_id DESC LIMIT 8", (app_id,)).fetchall()
 
 def cocoa(ts):
     if ts is None:
-        return "-"
-    return (datetime.datetime(2001, 1, 1) + datetime.timedelta(seconds=ts)).strftime("%Y-%m-%d %H:%M")
+        return "未送达"
+    return (datetime.datetime(2001, 1, 1) + datetime.timedelta(seconds=ts)
+            + datetime.timedelta(hours=8)).strftime("%m-%d %H:%M")
 
 def read(d):
     try:
@@ -179,8 +201,11 @@ echo "════════════════════════�
 if [[ "${IS_CDHASH}" -eq 1 ]]; then
   echo "结论：DR 是 cdhash 型 —— 通知身份不跨构建，存在旧版本通知残留风险。"
   echo
-  echo "  清理已有残留：./Scripts/cleanup-orphan-notifications.sh"
+  echo "  查看已有残留：./Scripts/cleanup-orphan-notifications.sh   # 默认只诊断"
   echo "  根治：        ./Scripts/sign-app.sh <App>    # 嵌入身份型 DR，无需证书"
+  echo
+  echo "  已有残留想真正静音：系统设置 → 通知 → 喝水提醒 → 关掉「允许通知」"
+  echo "  （按 bundle id 生效，对所有历史身份都有效；SIP 下没有别的安全办法）"
   exit 1
 else
   echo "结论：DR 是身份型 —— 通知身份跨构建稳定，新版能清理旧版的通知。"

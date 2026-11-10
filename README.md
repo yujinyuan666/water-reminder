@@ -223,6 +223,13 @@ CI 用 `codesign --sign -` 加一条**身份型 designated requirement**（`./Sc
 > 若确实用了证书，**`.signing/` 目录必须永久备份**。
 >
 > 已有残留清理：`./Scripts/cleanup-orphan-notifications.sh`（需终端有「完整磁盘访问」）。
+>
+> ⚠️ 该脚本现在**默认只诊断、不改库**。原因是 macOS 26 起 SIP 不允许停掉
+> `usernoted`（`bootout`/`kickstart` 被 150 拒绝，`launchctl kill` 报 Not privileged），
+> 唯一能停它的 `kill -TERM` 会让它把库判为损坏、改名 `db.corrupt` 后重建空库，
+> 一次清空所有 App 的通知历史。所以真正有效的做法是
+> **系统设置 → 通知 → 喝水提醒 → 关掉「允许通知」**——
+> 这一步按 bundle id 生效，对所有历史身份的残留都有效。
 
 要做到「下载即开、零提示」，见下一节。
 

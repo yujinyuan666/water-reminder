@@ -63,10 +63,24 @@
 - 让 xcodebuild 内部签证书：macOS target 要求「Mac Development」证书，
   而 `Apple Development` 会被拒绝（`No signing certificate "Mac Development" found`）。
   必须 `CODE_SIGNING_ALLOWED=NO` 构建后用 `codesign` 单独签。
+- **停掉 usernoted 去改通知库**（2026-11-10 实测，别重试）：
+  - `launchctl bootout gui/$UID/com.apple.usernoted` → `150: Operation not permitted while System Integrity Protection is engaged`
+  - `launchctl kickstart -k gui/$UID/com.apple.usernoted` → 同上
+  - `launchctl kill SIGTERM gui/$UID/com.apple.usernoted` → `Not privileged to signal service.`
+  - 只有 `kill -TERM <usernoted pid>` 真能停，但代价是：usernoted 把这个库判为损坏 →
+    旧库改名为 `db.corrupt` → **重建一个空库**，所有 App 的通知历史一次性归零
+    （实测 `app` 表 160 行 → 0 行），且重建后的库可能长时间不落盘（新通知只留在内存）。
+  - ⇒ `Scripts/cleanup-orphan-notifications.sh` 因此**默认只诊断不改库**；
+    想硬改需显式 `--force-db`，且脚本会在 usernoted 未真正停止时明确报错退出。
+- 想让幽灵通知消失，安全且有效的路径只有一条：
+  **系统设置 → 通知 → 喝水提醒 → 关掉「允许通知」**。
+  这一步按 bundle id 生效，与代码签名身份无关，因此对所有历史身份都有效。
 
 ### 系统通知库（供诊断，仅供诊断）
 
 - 活动库：`~/Library/Group Containers/group.com.apple.usernoted/db2/db`
+- 若同目录出现 `db.corrupt`（811008 B 左右），说明 usernoted 曾把旧库判为损坏并重建；
+  历史数据在那个文件里，活动库会是空库
 - 本 App 的表行：`app.identifier = 'com.waterreminder.app'`（库里 identifier 可能是小写）
 - `record.data` 是 bplist，含 `srce`（16 字节来源身份指纹）、`req.iden`、`req.trig`
 - `requests.list` / `delivered.list` 是加密 blob，解不开，别浪费时间
