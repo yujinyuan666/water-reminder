@@ -53,11 +53,46 @@ enum LaunchAtLogin {
     }
 }
 
+/// 处理「第二次启动」的两条路径。
+///
+/// 路径一（LaunchServices 已是单实例）：`open` 一个正在跑的 App 时系统根本不会起
+/// 第二个进程，直接调 `applicationShouldHandleReopen` —— 这里把主页打开。
+/// 路径二（真的起了第二个进程，例如从终端跑二进制、`open -n`、装了两份 App）：
+/// 第二份在 `App.init` 里就被 flock 挡住并退出，退出前发一条分布式通知，
+/// 由这里的观察者接到后打开主页。
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(
+            forName: SingleInstanceGuard.showHomeRequest,
+            object: nil,
+            queue: .main
+        ) { _ in
+            HomePanelController.shared.show()
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        HomePanelController.shared.show()
+        // 返回 false 表示「我已经处理了」，不让 AppKit 再按默认逻辑折腾窗口
+        return false
+    }
+}
+
 @main
 struct WaterReminderApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var settings = AppSettings.shared
 
     init() {
+        // 放在最前面：第二个实例在这里就要退掉，不能先去注册通知、开定时器
+        guard SingleInstanceGuard.acquire() else {
+            SingleInstanceGuard.requestShowHome()
+            // 给分布式通知一点时间送出去，再退出；否则会出现
+            // 「点了图标什么都没发生」的观感
+            Thread.sleep(forTimeInterval: 0.3)
+            exit(0)
+        }
+
         ReminderManager.shared.requestAuthorization()
         FullScreenAlertManager.shared.start()
     }

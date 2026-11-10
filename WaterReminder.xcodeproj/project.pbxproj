@@ -12,6 +12,8 @@
 		0A0000000000000000000000A4 /* MenuView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A00000000000000000000004 /* MenuView.swift */; };
 		0A0000000000000000000000A5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0A00000000000000000000005 /* Assets.xcassets */; };
 		0A0000000000000000000000A6 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = 0A00000000000000000000007 /* AppIcon.icns */; };
+		0A0000000000000000000000A7 /* SingleInstanceGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A00000000000000000000008 /* SingleInstanceGuard.swift */; };
+		0A0000000000000000000000A8 /* HomePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A00000000000000000000009 /* HomePanel.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +24,8 @@
 		0A00000000000000000000005 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		0A00000000000000000000007 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 		0A00000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		0A00000000000000000000008 /* SingleInstanceGuard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SingleInstanceGuard.swift; sourceTree = "<group>"; };
+		0A00000000000000000000009 /* HomePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomePanel.swift; sourceTree = "<group>"; };
 		0A0000000000000000000F0E /* WaterReminder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WaterReminder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -49,6 +53,8 @@
 				0A00000000000000000000002 /* AppSettings.swift */,
 				0A00000000000000000000003 /* ReminderManager.swift */,
 				0A00000000000000000000004 /* MenuView.swift */,
+				0A00000000000000000000008 /* SingleInstanceGuard.swift */,
+				0A00000000000000000000009 /* HomePanel.swift */,
 				0A00000000000000000000005 /* Assets.xcassets */,
 				0A00000000000000000000007 /* AppIcon.icns */,
 				0A00000000000000000000006 /* Info.plist */,
@@ -132,6 +138,8 @@
 				0A0000000000000000000000A2 /* AppSettings.swift in Sources */,
 				0A0000000000000000000000A3 /* ReminderManager.swift in Sources */,
 				0A0000000000000000000000A4 /* MenuView.swift in Sources */,
+				0A0000000000000000000000A7 /* SingleInstanceGuard.swift in Sources */,
+				0A0000000000000000000000A8 /* HomePanel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
