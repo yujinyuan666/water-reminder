@@ -111,8 +111,11 @@ APP=build/dd/Build/Products/Release/WaterReminder.app
 VERSION=1.0.0
 mkdir -p dist
 
-# 0) ad-hoc 签名（Apple Silicon 上未签名的 App 会被系统直接杀掉，这步不能省）
-codesign --force --deep --sign - "$APP"
+# 0) 签名（Apple Silicon 上未签名的 App 会被系统直接杀掉，这步不能省）
+#    有证书就用 ./Scripts/sign-app.sh，它会让通知身份跨构建稳定；
+#    没有证书时它会自动降级成 ad-hoc 并提示风险，效果等同下一行：
+# codesign --force --deep --sign - "$APP"
+./Scripts/sign-app.sh "$APP"
 
 # 1) 组装两份载荷：App + 一键安装脚本 + 安装说明
 rm -rf dist/dmg_staging dist/zip_staging
@@ -184,7 +187,32 @@ Gitee 官方限制，务必留意：
 
 ### 关于签名
 
-CI 使用 `codesign --sign -`（ad-hoc 自签名），**不需要任何证书**，任何人 clone 下来都能复现。代价是下载者首次打开会被 Gatekeeper 拦一次（包内 `安装.command` 已自动处理）。要做到「下载即开、零提示」，见下一节。
+CI 默认用 `codesign --sign -`（ad-hoc 自签名），**不需要任何证书**，任何人 clone 下来都能复现。代价是下载者首次打开会被 Gatekeeper 拦一次（包内 `安装.command` 已自动处理）。
+
+> ⚠️ **ad-hoc 签名有一个不明显但很烦的副作用：系统通知的身份会随每次构建变化。**
+>
+> macOS 的 `UNUserNotificationCenter` 按**代码签名身份**隔离待发通知。ad-hoc 签名时，
+> 这个身份就是构建产物的 cdhash —— 而 cdhash 每构建一次都不一样。于是：
+>
+> - 新版本调用 `removeAllPendingNotificationRequests()` 只能清掉**自己**排的通知；
+> - 旧版本排下的通知，新版既看不见也清不掉，会继续按原计划每天弹；
+> - 用户会看到「我已经把这条规则改成全屏提示了，怎么通知栏还在弹」。
+>
+> 解决办法是给一个**稳定的签名身份**（自签名证书即可，不需要 $99 开发者账号）：
+>
+> ```bash
+> ./Scripts/make-signing-cert.sh     # 生成证书并导入钥匙串（只需跑一次）
+> ./Scripts/sign-app.sh <App.app>    # 用它签名
+> ./Scripts/check-notification-identity.sh <App.app>   # 确认 DR 是身份型
+> ```
+>
+> 证书的 `.p12` 与密码存进 GitHub Secrets（`SIGNING_CERT_P12_BASE64` /
+> `SIGNING_CERT_PASSWORD`）后，CI 会自动用它签名；没配则退回 ad-hoc 并在日志里告警。
+> **`.signing/` 目录必须永久备份** —— 证书换了，通知身份也就换了。
+>
+> 已有残留清理：`./Scripts/cleanup-orphan-notifications.sh`（需终端有「完整磁盘访问」）。
+
+要做到「下载即开、零提示」，见下一节。
 
 ## 🚀 正式分发：签名与公证（推荐用于公开发布）
 

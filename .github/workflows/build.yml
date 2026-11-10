@@ -24,9 +24,13 @@ env:
   SCHEME: WaterReminder
   PROJECT: WaterReminder.xcodeproj
   DERIVED: build/dd
-  # 未持有 Apple 开发者证书，采用 ad-hoc 自签名
-  # 需要「下载即开、无任何提示」的话，见 README「正式分发」章节
   APP_PATH: build/dd/Build/Products/Release/WaterReminder.app
+  # 签名证书（可选）。不配置也能构建，只是退回 ad-hoc —— 那种情况下通知身份
+  # 会随每次构建变化，旧版本排下的通知清不掉（详见 Scripts/check-notification-identity.sh）。
+  # 这里的写法是为了让后续 step 能用 `if: env.SIGNING_CERT_P12_BASE64 != ''` 判断，
+  # 因为 GitHub Actions 的 step `if` 里读不到 secrets 上下文。
+  SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+  SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
 
 jobs:
   build:
@@ -108,20 +112,63 @@ jobs:
             build
 
       # ---------------------------------------------------------------
-      # 3. ad-hoc 签名（关键：Apple Silicon 上未签名 App 会被直接杀掉）
+      # 3. 签名与校验
+      #
+      # 为什么这里不能只用 ad-hoc（`--sign -`）：
+      #   macOS 的 UNUserNotificationCenter 按「代码签名身份」隔离待发通知。
+      #   ad-hoc 签名的 designated requirement 就是 cdhash 本身，而 cdhash
+      #   每构建一次都不同 ⇒ 每发一版都是一个全新的通知身份。
+      #   于是新版本 removeAllPendingNotificationRequests() 只能清掉自己的，
+      #   旧版本排下的通知既看不见也清不掉，会继续每天弹。
+      #
+      #   配了证书（SIGNING_CERT_P12_BASE64）时 DR 变成
+      #   `identifier "..." and certificate leaf = ...`，跨构建稳定 ⇒ 能清掉旧版残留。
+      #   没配则降级 ad-hoc 并打警告，不让构建失败（首次接入、fork 等场景）。
+      #
+      # 注意 xcodebuild 内部签名会拒绝非 Apple 签发的证书，所以构建阶段是
+      # CODE_SIGNING_ALLOWED=NO，签名在下面用 codesign 单独做。
       # ---------------------------------------------------------------
+      - name: 导入签名证书
+        if: ${{ env.SIGNING_CERT_P12_BASE64 != '' }}
+        env:
+          SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="${RUNNER_TEMP}/signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)"
+
+          security create-keychain -p "${KEYCHAIN_PASS}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 3600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASS}" "${KEYCHAIN}"
+
+          echo -n "${SIGNING_CERT_P12_BASE64}" | base64 --decode > "${RUNNER_TEMP}/signing.p12"
+          security import "${RUNNER_TEMP}/signing.p12" \
+            -k "${KEYCHAIN}" -P "${SIGNING_CERT_PASSWORD}" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASS}" "${KEYCHAIN}"
+
+          # 把临时钥匙串加进搜索列表，否则 codesign 找不到身份
+          security list-keychains -d user -s "${KEYCHAIN}" $(security list-keychains -d user | tr -d '"')
+
+          rm -f "${RUNNER_TEMP}/signing.p12"
+          echo "可用签名身份："
+          security find-identity -v -p codesigning "${KEYCHAIN}"
+
       - name: 签名与校验
         run: |
           set -euo pipefail
           test -d "${APP_PATH}" || { echo "构建产物不存在：${APP_PATH}"; exit 1; }
 
-          codesign --force --deep --sign - "${APP_PATH}"
+          ./Scripts/sign-app.sh "${APP_PATH}"
 
           echo "--- 架构 ---"
           lipo -archs "${APP_PATH}/Contents/MacOS/${APP_NAME}"
-          echo "--- 签名 ---"
-          codesign --verify --strict --verbose=2 "${APP_PATH}"
-          codesign -dv --verbose=2 "${APP_PATH}" 2>&1 | sed -n '1,12p'
+          echo "--- 通知身份检查 ---"
+          # 注意：CI 机器上读不到系统通知库（没有完整磁盘访问），
+          # 这一节会打印「找不到通知库」然后跳过，属于预期行为。
+          ./Scripts/check-notification-identity.sh "${APP_PATH}" || true
           echo "--- Info.plist ---"
           plutil -p "${APP_PATH}/Contents/Info.plist" | sed -n '1,20p'
 
@@ -173,7 +220,13 @@ jobs:
             echo "构建时间: ${{ steps.meta.outputs.build_time }}"
             echo "架构:     $(lipo -archs "${APP_PATH}/Contents/MacOS/${APP_NAME}")"
             echo "最低系统: macOS 13.0"
-            echo "签名方式: ad-hoc 自签名（未公证）"
+            if codesign -d -r- "${APP_PATH}" 2>&1 | grep -q 'cdhash H"'; then
+              echo "签名方式: ad-hoc 自签名（未公证）"
+              echo "通知身份: cdhash 型 —— 每次构建都会变，旧版本通知清不掉"
+            else
+              echo "签名方式: 证书签名（未公证）"
+              echo "通知身份: 身份型 —— 跨构建稳定"
+            fi
           } > dist/BUILD-INFO.txt
 
           echo "--- dist 产物 ---"
@@ -193,6 +246,13 @@ jobs:
             HEADLINE="> 🔄 这是跟随 \`master\` 分支自动滚动的构建，每次推送都会被覆盖为最新版本。"
           else
             HEADLINE="> 🎉 正式发布版本 \`${{ steps.meta.outputs.tag }}\`。"
+          fi
+
+          # 签名方式决定「首次打开提示」那段怎么写
+          if codesign -d -r- "${APP_PATH}" 2>&1 | grep -q 'cdhash H"'; then
+            SIGN_LABEL="ad-hoc 自签名"
+          else
+            SIGN_LABEL="证书签名"
           fi
 
           cat > dist/RELEASE_NOTES.md <<EOF
@@ -219,7 +279,7 @@ jobs:
 
           ## ⚠️ 首次打开提示
 
-          本版本使用 **ad-hoc 自签名**（未走 Apple 开发者公证），首次打开会被 Gatekeeper 拦截一次：
+          本版本使用 **${SIGN_LABEL}**（未走 Apple 开发者公证），首次打开会被 Gatekeeper 拦截一次：
 
           1. 把 \`${APP_NAME}.app\` 拖进「应用程序」
           2. **右键点击** App → 选「打开」→ 弹窗里再点「打开」
