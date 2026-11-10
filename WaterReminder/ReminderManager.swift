@@ -10,6 +10,15 @@ final class ReminderManager {
 
     let identifierPrefix = "waterreminder."
 
+    /// 排程代数。每次 `schedule()` 自增，用于让「异步对账」知道自己是不是过期的那一代。
+    ///
+    /// 为什么必须有：`schedule()` 末尾要异步等所有 `add` 回来再回读对账，
+    /// 而对账会把「不该存在的 identifier」删掉。如果用户连续改两次配置，
+    /// 第一代的对账回调可能在第二代已经排好之后才跑，把第二代刚排下的通知当成
+    /// 残留删掉 —— 用户看到的现象是「配置反复改几次之后，某些提醒就不响了」。
+    /// 只允许最新一代的对账动系统里的通知，就堵住了这个窗口。
+    private var scheduleGeneration: UInt64 = 0
+
     /// 触发容忍窗口：触发点过去这么久之内仍视为「应当已触发」。
     /// 一方面兜住 tick 被推迟的情况（App Nap、系统繁忙、屏幕锁定），
     /// 另一方面用来判断「仅一次」规则的目标时刻是否真的已经过期。
@@ -75,6 +84,13 @@ final class ReminderManager {
 
     private func schedule() {
         let s = AppSettings.shared
+
+        // 先领一个代数号：后面所有异步回调都拿它判断自己是否过期。
+        // 注意要在最前面（包括下面的早退分支之前）就自增，
+        // 否则「关掉总开关」这条路径不会让在途的旧对账失效。
+        scheduleGeneration &+= 1
+        let generation = scheduleGeneration
+
         // 关掉总开关或清空规则后，旧的截断告警必须一起消失，否则面板上会挂着
         // 一条「你的配置超出上限」的提示，而实际压根没在排程
         guard s.isEnabled, !s.rules.isEmpty else {
@@ -138,6 +154,13 @@ final class ReminderManager {
         let maxTriggers = 64
         let center = UNUserNotificationCenter.current()
 
+        // 期望注册成功的 identifier。注册完成后会拿它跟系统里实际的待发通知对账
+        var expectedIDs: Set<String> = []
+        // add() 的失败原因。add 在未授权时是**静默失败**的，不看 error 就永远不知道
+        var addErrors: [String] = []
+        let addLock = NSLock()
+        let addGroup = DispatchGroup()
+
         for item in oneTimeDates.sorted(by: { $0.date < $1.date }) {
             if scheduled >= maxTriggers { break }
             let comps = cal.dateComponents([.year, .month, .day, .hour, .minute], from: item.date)
@@ -146,7 +169,16 @@ final class ReminderManager {
             // 只用时间戳会让它们撞成同一个 identifier，后 add 的直接覆盖前 add，只剩一条能送达
             let id = "\(identifierPrefix)once_\(item.ruleID.uuidString)_\(Int(item.date.timeIntervalSince1970))"
             let req = UNNotificationRequest(identifier: id, content: makeContent(), trigger: trigger)
-            center.add(req) { _ in }
+            expectedIDs.insert(id)
+            addGroup.enter()
+            center.add(req) { error in
+                if let error {
+                    addLock.lock()
+                    addErrors.append("\(id): \(error.localizedDescription)")
+                    addLock.unlock()
+                }
+                addGroup.leave()
+            }
             scheduled += 1
         }
         let sortedFires = repeating.sorted {
@@ -164,17 +196,106 @@ final class ReminderManager {
             let key = fire.weekday.map { "wd\($0)" } ?? "daily"
             let id = "\(identifierPrefix)r_\(key)_\(String(format: "%02d", fire.hour))\(String(format: "%02d", fire.minute))"
             let req = UNNotificationRequest(identifier: id, content: makeContent(), trigger: trigger)
-            center.add(req) { _ in }
+            expectedIDs.insert(id)
+            addGroup.enter()
+            center.add(req) { error in
+                if let error {
+                    addLock.lock()
+                    addErrors.append("\(id): \(error.localizedDescription)")
+                    addLock.unlock()
+                }
+                addGroup.leave()
+            }
             scheduled += 1
         }
 
         // 3) 把截断结果告诉界面：静默丢提醒是最难被发现的一类问题
         let wanted = repeating.count + oneTimeDates.count
-        if wanted > maxTriggers {
+        let truncated = wanted > maxTriggers
+        if truncated {
             s.scheduleWarning = "系统最多只允许 \(maxTriggers) 条通知，当前配置需要 \(wanted) 条，"
                 + "超出部分不会提醒。请减少规则或缩短循环区间。"
         } else {
             s.scheduleWarning = nil
+        }
+
+        // 4) 排程自检：等所有 add 都回来之后，回读系统里的待发通知，和期望集合对账
+        //
+        // 这一步能发现两类问题：
+        //   · 该排的没排上 —— 典型是用户关掉了通知权限，add 静默失败，界面却一切正常
+        //   · 排上了但不该存在 —— 同一身份下的历史残留（改了规则却没被清掉的旧 identifier）
+        //
+        // 必须等 addGroup 全部完成再读，否则刚 add 完就查会拿到「还没落地」的假缺失。
+        //
+        // 能力边界（很重要，不要误以为它能解决跨版本问题）：
+        //   这里只能看见**当前签名身份**下的通知。ad-hoc 签名时每个构建都是新身份，
+        //   历史构建排下的通知这里既看不见也删不掉。那个问题只能在构建侧根治，
+        //   见 Scripts/check-notification-identity.sh 与 Scripts/sign-app.sh。
+        addGroup.notify(queue: .main) { [weak self] in
+            guard let self, generation == self.scheduleGeneration else { return }
+            addLock.lock()
+            let failures = addErrors
+            addLock.unlock()
+            self.verifyScheduledNotifications(
+                expected: expectedIDs,
+                failures: failures,
+                truncated: truncated,
+                generation: generation
+            )
+        }
+    }
+
+    /// 回读系统里的待发通知，跟「刚排下去的那批」对账：
+    /// 缺了的报给界面，多出来的（同一身份下的残留）直接删掉。
+    private func verifyScheduledNotifications(
+        expected: Set<String>,
+        failures: [String],
+        truncated: Bool,
+        generation: UInt64
+    ) {
+        guard !expected.isEmpty || truncated else { return }
+        let center = UNUserNotificationCenter.current()
+        let prefix = identifierPrefix
+
+        center.getPendingNotificationRequests { [weak self] pending in
+            guard let self else { return }
+            // 回读是异步的，这期间用户可能又改了配置、又排了一轮。
+            // 那一轮排下的通知，在「我这一代的期望集合」里当然找不到 ——
+            // 若照删不误，用户会看到「改几次配置之后某些提醒就不响了」。
+            guard generation == self.scheduleGeneration else { return }
+
+            let actual = Set(pending.map { $0.identifier }.filter { $0.hasPrefix(prefix) })
+            let missing = expected.subtracting(actual)
+            let stale = actual.subtracting(expected)
+
+            // 同一身份下多出来的通知：已经不归任何规则管，删掉
+            if !stale.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: Array(stale))
+            }
+
+            guard !missing.isEmpty || !stale.isEmpty || !failures.isEmpty else { return }
+
+            DispatchQueue.main.async {
+                // 又一次异步跳转，再确认一遍代数没变
+                guard generation == self.scheduleGeneration else { return }
+                let s = AppSettings.shared
+
+                // add() 在未授权时是静默失败的，不看 error 就永远不知道。
+                // 这种情况下 missing 会等于「全部没排上」，必须让用户看见。
+                guard !missing.isEmpty || !failures.isEmpty else { return }
+
+                var msg = "有 \(max(missing.count, failures.count)) 条提醒没能注册到系统通知中心。"
+                msg += "请检查「系统设置 → 通知 → 喝水提醒」是否允许通知。"
+                if let first = failures.first {
+                    msg += "（首个错误：\(first)）"
+                }
+                // 截断告警如果已经在了，别直接盖掉 —— 两件事可以同时成立，
+                // 而「超出 64 条」比「注册失败」更常被用户自己看到
+                if let existing = s.scheduleWarning, existing.contains("最多只允许") {
+                    msg = existing + " 另外，" + msg
+                }
+                s.scheduleWarning = msg
+            }
         }
     }
 
