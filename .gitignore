@@ -3,3 +3,7 @@
 /dist
 .DS_Store
 *.xcuserstate
+
+# 代码签名证书与私钥 —— 绝不能提交。
+# 生成方式见 Scripts/make-signing-cert.sh，备份方式见该脚本末尾的提示。
+.signing/
