@@ -114,16 +114,19 @@ jobs:
       # ---------------------------------------------------------------
       # 3. 签名与校验
       #
-      # 为什么这里不能只用 ad-hoc（`--sign -`）：
+      # 关键不是「用不用证书」，而是签名里有没有一条**身份型
+      # designated requirement**：
       #   macOS 的 UNUserNotificationCenter 按「代码签名身份」隔离待发通知。
-      #   ad-hoc 签名的 designated requirement 就是 cdhash 本身，而 cdhash
-      #   每构建一次都不同 ⇒ 每发一版都是一个全新的通知身份。
-      #   于是新版本 removeAllPendingNotificationRequests() 只能清掉自己的，
-      #   旧版本排下的通知既看不见也清不掉，会继续每天弹。
+      #   裸 `codesign --sign -` 的 DR 会自动取 cdhash，而 cdhash 每构建一次
+      #   都不同 ⇒ 每发一版都是全新的通知身份 ⇒ 新版本清不掉旧版本的通知，
+      #   那些通知会一直按原计划弹（用户表现为「改成全屏提示了还在弹通知」）。
       #
-      #   配了证书（SIGNING_CERT_P12_BASE64）时 DR 变成
-      #   `identifier "..." and certificate leaf = ...`，跨构建稳定 ⇒ 能清掉旧版残留。
-      #   没配则降级 ad-hoc 并打警告，不让构建失败（首次接入、fork 等场景）。
+      #   ./Scripts/sign-app.sh 总是带
+      #   `-r='designated => identifier "<bundle id>"'`，把 DR 钉在 bundle id 上，
+      #   于是跨构建身份稳定。这条 DR 不依赖证书，CI 无需任何 Secret 即可生效。
+      #
+      #   配了证书（SIGNING_CERT_P12_BASE64）时只是换成更强的签名身份，
+      #   脚本仍会带上同一条 DR，因此**换证书也不会把通知身份弄断**。
       #
       # 注意 xcodebuild 内部签名会拒绝非 Apple 签发的证书，所以构建阶段是
       # CODE_SIGNING_ALLOWED=NO，签名在下面用 codesign 单独做。
@@ -220,11 +223,17 @@ jobs:
             echo "构建时间: ${{ steps.meta.outputs.build_time }}"
             echo "架构:     $(lipo -archs "${APP_PATH}/Contents/MacOS/${APP_NAME}")"
             echo "最低系统: macOS 13.0"
+            # 判断依据是 DR 的类型（而不是「有没有证书」）：
+            # 身份型 DR 才是「通知身份跨构建稳定」的充要条件，
+            # ad-hoc + -r 与证书签名都算身份型。
             if codesign -d -r- "${APP_PATH}" 2>&1 | grep -q 'cdhash H"'; then
-              echo "签名方式: ad-hoc 自签名（未公证）"
+              echo "签名方式: ad-hoc（裸签名，无身份型 DR）（未公证）"
               echo "通知身份: cdhash 型 —— 每次构建都会变，旧版本通知清不掉"
+            elif [ -n "$(codesign -dvvv "${APP_PATH}" 2>&1 | grep -m1 '^Authority=' || true)" ]; then
+              echo "签名方式: 证书签名 + 身份型 DR（未公证）"
+              echo "通知身份: 身份型 —— 跨构建稳定"
             else
-              echo "签名方式: 证书签名（未公证）"
+              echo "签名方式: ad-hoc + 身份型 DR（未公证）"
               echo "通知身份: 身份型 —— 跨构建稳定"
             fi
           } > dist/BUILD-INFO.txt
@@ -251,8 +260,10 @@ jobs:
           # 签名方式决定「首次打开提示」那段怎么写
           if codesign -d -r- "${APP_PATH}" 2>&1 | grep -q 'cdhash H"'; then
             SIGN_LABEL="ad-hoc 自签名"
-          else
+          elif [ -n "$(codesign -dvvv "${APP_PATH}" 2>&1 | grep -m1 '^Authority=' || true)" ]; then
             SIGN_LABEL="证书签名"
+          else
+            SIGN_LABEL="ad-hoc 签名（已嵌入身份型 DR）"
           fi
 
           cat > dist/RELEASE_NOTES.md <<EOF

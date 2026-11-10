@@ -112,9 +112,10 @@ VERSION=1.0.0
 mkdir -p dist
 
 # 0) 签名（Apple Silicon 上未签名的 App 会被系统直接杀掉，这步不能省）
-#    有证书就用 ./Scripts/sign-app.sh，它会让通知身份跨构建稳定；
-#    没有证书时它会自动降级成 ad-hoc 并提示风险，效果等同下一行：
-# codesign --force --deep --sign - "$APP"
+#    必须用 ./Scripts/sign-app.sh —— 它在签名里嵌入一条身份型 DR
+#    （designated => identifier "<bundle id>"），让通知身份跨构建稳定。
+#    不需要证书；有证书时它只是换成更强的签名身份，DR 不变。
+#    千万不要手写 codesign --sign -（那会让 DR 退回 cdhash 型，见下方「关于签名」）
 ./Scripts/sign-app.sh "$APP"
 
 # 1) 组装两份载荷：App + 一键安装脚本 + 安装说明
@@ -187,28 +188,39 @@ Gitee 官方限制，务必留意：
 
 ### 关于签名
 
-CI 默认用 `codesign --sign -`（ad-hoc 自签名），**不需要任何证书**，任何人 clone 下来都能复现。代价是下载者首次打开会被 Gatekeeper 拦一次（包内 `安装.command` 已自动处理）。
+CI 用 `codesign --sign -` 加一条**身份型 designated requirement**（`./Scripts/sign-app.sh` 负责），**不需要任何证书**，任何人 clone 下来都能复现。代价是下载者首次打开会被 Gatekeeper 拦一次（包内 `安装.command` 已自动处理）。
 
-> ⚠️ **ad-hoc 签名有一个不明显但很烦的副作用：系统通知的身份会随每次构建变化。**
+> ⚠️ **裸 `codesign --sign -` 有一个不明显但很烦的副作用：系统通知的身份会随每次构建变化。**
 >
-> macOS 的 `UNUserNotificationCenter` 按**代码签名身份**隔离待发通知。ad-hoc 签名时，
-> 这个身份就是构建产物的 cdhash —— 而 cdhash 每构建一次都不一样。于是：
+> macOS 的 `UNUserNotificationCenter` 按**代码签名身份**隔离待发通知。不指定
+> designated requirement 时，这个身份就是构建产物的 cdhash —— 而 cdhash 每构建
+> 一次都不一样。于是：
 >
 > - 新版本调用 `removeAllPendingNotificationRequests()` 只能清掉**自己**排的通知；
 > - 旧版本排下的通知，新版既看不见也清不掉，会继续按原计划每天弹；
 > - 用户会看到「我已经把这条规则改成全屏提示了，怎么通知栏还在弹」。
 >
-> 解决办法是给一个**稳定的签名身份**（自签名证书即可，不需要 $99 开发者账号）：
+> **修法：签名时显式嵌入一条身份型 DR**，把身份钉在 bundle id 上，与 cdhash 无关：
 >
 > ```bash
-> ./Scripts/make-signing-cert.sh     # 生成证书并导入钥匙串（只需跑一次）
-> ./Scripts/sign-app.sh <App.app>    # 用它签名
-> ./Scripts/check-notification-identity.sh <App.app>   # 确认 DR 是身份型
+> ./Scripts/sign-app.sh <App.app>   # 内部就是 codesign --sign - -r='designated => identifier "<bundle id>"'
+> ./Scripts/check-notification-identity.sh <App.app>   # 确认 DR 是身份型（退出码 0 = 好）
+> ```
+>
+> 这条 DR **不需要证书、不需要钥匙串、不需要任何 Secret**，CI 与本地一视同仁。
+> 只用了这套之后，未来任意版本都能看见并清掉旧版本残留（已验证：身份型 DR 的新版
+> 能清掉纯 ad-hoc 旧版排的通知）。
+>
+> 想要更强的签名身份（比如自签名证书，仍然不需要 $99 账号）可以额外做：
+>
+> ```bash
+> ./Scripts/make-signing-cert.sh     # 生成证书并导入钥匙串（只需跑一次，在你自己终端跑）
+> ./Scripts/sign-app.sh <App.app>    # 自动优先用它签名，身份型 DR 不变
 > ```
 >
 > 证书的 `.p12` 与密码存进 GitHub Secrets（`SIGNING_CERT_P12_BASE64` /
-> `SIGNING_CERT_PASSWORD`）后，CI 会自动用它签名；没配则退回 ad-hoc 并在日志里告警。
-> **`.signing/` 目录必须永久备份** —— 证书换了，通知身份也就换了。
+> `SIGNING_CERT_PASSWORD`）后 CI 会自动用它；没配也不影响通知身份的正确性。
+> 若确实用了证书，**`.signing/` 目录必须永久备份**。
 >
 > 已有残留清理：`./Scripts/cleanup-orphan-notifications.sh`（需终端有「完整磁盘访问」）。
 

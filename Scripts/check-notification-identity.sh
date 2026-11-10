@@ -59,16 +59,19 @@ echo "    CDHash    ：${CDHASH:-未知}"
 echo "    签发者    ：${AUTHORITY:-（无 —— ad-hoc 签名）}"
 echo "    指定要求  ：${DR:-未知}"
 
-IS_ADHOC=0
+# 判据是 DR 的类型，不是「有没有证书」：
+#   cdhash 型 ⇒ 每构建换通知身份（坏）
+#   身份型   ⇒ 跨构建稳定（好，ad-hoc 或证书都行）
+IS_CDHASH=0
 if echo "${DR}" | grep -q 'cdhash H"'; then
-  IS_ADHOC=1
+  IS_CDHASH=1
 fi
 
 echo
-if [[ "${IS_ADHOC}" -eq 1 ]]; then
+if [[ "${IS_CDHASH}" -eq 1 ]]; then
   echo "    ⚠️  DR 是 **cdhash 型**：每次构建都是新的通知身份。"
   echo "        旧版本排下的通知，新版本清不掉，会一直弹。"
-  echo "        修法：跑 ./Scripts/make-signing-cert.sh，然后用 ./Scripts/sign-app.sh 签名。"
+  echo "        修法：用 ./Scripts/sign-app.sh 重新签名（它会嵌入身份型 DR，不需要证书）。"
 else
   echo "    ✅ DR 是 **身份型**：跨构建稳定，新版能清理旧版的通知。"
 fi
@@ -173,13 +176,13 @@ fi
 # ---------- 3. 结论 ----------
 echo
 echo "════════════════════════════════════════════════════════════"
-if [[ "${IS_ADHOC}" -eq 1 ]]; then
-  echo "结论：ad-hoc 签名 —— 通知身份不跨构建，存在旧版本通知残留风险。"
+if [[ "${IS_CDHASH}" -eq 1 ]]; then
+  echo "结论：DR 是 cdhash 型 —— 通知身份不跨构建，存在旧版本通知残留风险。"
   echo
   echo "  清理已有残留：./Scripts/cleanup-orphan-notifications.sh"
-  echo "  根治：        ./Scripts/make-signing-cert.sh && ./Scripts/sign-app.sh <App>"
+  echo "  根治：        ./Scripts/sign-app.sh <App>    # 嵌入身份型 DR，无需证书"
   exit 1
 else
-  echo "结论：证书签名 —— 通知身份跨构建稳定。"
+  echo "结论：DR 是身份型 —— 通知身份跨构建稳定，新版能清理旧版的通知。"
   exit 0
 fi

@@ -9,8 +9,13 @@
 
 ### 铁律
 
-> **ad-hoc 签名（`codesign --sign -`）⇒ designated requirement = cdhash
-> ⇒ 每次构建都是新的「系统通知身份」⇒ 旧版本排下的通知既看不见也清不掉，会一直弹。**
+> **代码签名不指定 designated requirement（即裸 `codesign --sign -`）
+> ⇒ DR 自动取 cdhash ⇒ 每次构建都是新的「系统通知身份」
+> ⇒ 旧版本排下的通知既看不见也清不掉，会一直弹。**
+>
+> 修法只有一条：**签名时显式嵌入一条身份型 DR**（`-r='designated => identifier "<bundle id>"'`）。
+> 这条 DR 只绑 bundle id，不绑 cdhash、不绑证书 —— 不需要证书、不需要钥匙串、
+> 不需要任何 Secret，CI 与本地行为完全一致。
 
 这不是推测，是实测结论（2026-11-10）。展开说明：
 
@@ -26,15 +31,27 @@
 
 ### 必须遵守
 
-1. **不要改回 `codesign --force --deep --sign -`**。CI 与本地打包一律走
-   `./Scripts/sign-app.sh`，它会优先用证书、无证书才降级 ad-hoc 并告警。
-2. **`.signing/` 目录（证书与私钥）一旦生成就永久备份，不要重新生成**。
-   证书换了 = 通知身份换了 = 又一轮清不掉的残留。
+1. **签名一律走 `./Scripts/sign-app.sh`，不要手写 `codesign`。**
+   它总是带 `-r` 嵌入身份型 DR；手写 `codesign --sign -` 会退回 cdhash 型，
+   等于把已经修好的问题重新引入一遍。
+   - 脚本仍然支持证书（`SIGNING_IDENTITY`），但**证书只是加强，不是必需**。
+   - `codesign` 失败时可能已经删掉旧签名并退回 cdhash DR，所以脚本把
+     签名失败当**致命错误**（`exit 1`）—— 不要改成「失败也继续」。
+2. **`.signing/` 目录（若你确实用了证书）一旦生成就永久备份，不要重新生成**。
+   虽然身份型 DR 已经绑在 bundle id 上、换证书也不断身份（实测过：
+   证书签名与 ad-hoc 身份型 DR 可以互相看见并清理），但保留它更省心。
 3. `Scripts/check-notification-identity.sh` 的退出码是契约：
    `0` = 身份型（好），`1` = cdhash 型（有残留风险）。CI/脚本据此判断。
 4. 判断 DR 类型时**不能** `grep '^designated'`：App 没嵌入 DR 时，
    `codesign -d -r-` 打印的是计算出来的结果，行首带 `# `（`# designated => ...`）。
    正确写法：`grep 'designated' | sed 's/^# *//'`。
+5. **嵌入的 DR 必须是 ad-hoc 真能满足的**。ad-hoc 没有证书链，
+   所以 `anchor apple generic` / `certificate leaf` 这类条件它满足不了；
+   写成那样会得到「签名成功、但产物不满足自己声明的 DR」的坏包
+   （`codesign --verify --strict --verbose=2` 报
+   `valid on disk` + `does not satisfy its designated Requirement`）。
+   默认的 `designated => identifier "<bundle id>"` 是安全写法。
+   `sign-app.sh` 已经把这种情况当致命错误，别把它降级成警告。
 
 ### 已确认做不到的事（别再试）
 
