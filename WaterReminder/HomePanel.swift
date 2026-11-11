@@ -46,7 +46,12 @@ final class HomePanelController: NSObject, NSWindowDelegate {
             defer: false
         )
         panel.title = "喝水提醒"
-        panel.contentView = hosting
+        // MenuView 自己不带背景 —— 在 MenuBarExtra 里那层毛玻璃是系统给的。
+        // 换到独立 NSPanel 之后没有人铺背景，窗口又必须是圆角面板而不是
+        // 一块矩形，所以这里补一个 .popover 材质的 NSVisualEffectView 当底，
+        // 视觉上才和点状态栏出来的面板一致。没有它的话面板是透明的，
+        // 背后的文字会直接透上来。
+        panel.contentView = Self.makeBackdrop(size: initialSize, hosting: hosting)
         // 压在菜单栏之上，否则弹出时会被菜单栏挡住顶部；但不用 .screenSaver(1000)，
         // 那会盖住系统密码框与权限弹窗
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
@@ -88,6 +93,36 @@ final class HomePanelController: NSObject, NSWindowDelegate {
 
     func toggle() {
         if isVisible { close() } else { show() }
+    }
+
+    // MARK: - 背景
+
+    /// 毛玻璃底 + 圆角裁剪，把 `hosting` 铺在上面。
+    ///
+    /// 两个要点，都是踩过的：
+    /// 1. `NSVisualEffectView` **直接**当 `contentView`。套一层带 `masksToBounds`
+    ///    的父容器会让 `behindWindow` 合成被祖先裁剪掉，毛玻璃整块不出现。
+    /// 2. 再给它的图层垫一层近乎不透明的底色当保险。毛玻璃是系统私有 backdrop
+    ///    图层画的，一旦某台机器/某个外观下合成不出来，面板就会像用户截图那样
+    ///    整片透明、背后文字全透上来。垫了底色最坏也只是「没有模糊」，而不是「看不见」。
+    private static func makeBackdrop(size: NSSize, hosting: NSHostingView<AnyView>) -> NSView {
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        effect.autoresizingMask = [.width, .height]
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 10
+        effect.layer?.masksToBounds = true
+        // 保险底色：正常情况被 backdrop 覆盖看不见，合成失败时兜住可读性
+        effect.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+        // 一圈极淡描边，和点状态栏出来的面板观感一致，也让面板边界在浅色背景上能看清
+        effect.layer?.borderWidth = 0.5
+        effect.layer?.borderColor = NSColor.separatorColor.cgColor
+
+        hosting.frame = NSRect(origin: .zero, size: size)
+        effect.addSubview(hosting)
+        return effect
     }
 
     // MARK: - NSWindowDelegate
